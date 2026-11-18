@@ -1210,6 +1210,7 @@ export default function App() {
             <SizingRoadmapView
               sizing={data.sizing}
               activeRole={data.currentRole}
+              isGlobalSuperadmin={Boolean(data.currentUser.isGlobalSuperadmin)}
               onSaveSizing={handleSaveSizing}
             />
           )}

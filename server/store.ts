@@ -1629,6 +1629,14 @@ const LOCKOUT_MS = 15 * 60_000;
 // Keeps login timing similar whether or not the username exists.
 const DUMMY_PASSWORD_HASH = hashPasswordSync(crypto.randomBytes(12).toString('hex'));
 
+/** Business-rule violation that should reach the client as HTTP 400. */
+export class DomainError extends Error {
+  readonly status = 400;
+}
+
+/** Audit entries about global settings (visible only to the superadmin). */
+export const GLOBAL_AUDIT_TENANT = 'global';
+
 /** Random id fragment. Replaces timestamp-based ids, which could collide and overwrite rows on upsert. */
 function uid(): string {
   return crypto.randomUUID().replace(/-/g, '').slice(0, 10);
@@ -1725,6 +1733,14 @@ class FleetStore {
   /** Resolves once every queued write is committed; rejects if the latest write failed. */
   async flush(): Promise<void> {
     await this.pendingWrite;
+  }
+
+  /** Returns the tenant id if it exists; never falls back to another company. */
+  private requireTenant(tenantId: string): string {
+    if (!this.state.tenants.some((t) => t.id === tenantId)) {
+      throw new DomainError('La empresa destino no existe. Selecciona una empresa válida.');
+    }
+    return tenantId;
   }
 
   private buildGlobalTenantSummary(): Tenant {
@@ -2209,9 +2225,7 @@ class FleetStore {
     actorRole: string,
     actorHidden = false
   ): RoleDefinition {
-    const resolvedTenantId = this.state.tenants.some((t) => t.id === tenantId)
-      ? tenantId
-      : this.state.tenants[0].id;
+    const resolvedTenantId = this.requireTenant(tenantId);
     const normalizedPermissions: ModulePermissions = {
       ...input.permissions,
       dashcams_config: input.permissions.dashcams_config ?? 'none',
@@ -2242,7 +2256,7 @@ class FleetStore {
   updateRole(
     tenantId: string,
     roleId: string,
-    patch: { name?: string; description?: string; permissions?: ModulePermissions },
+    patch: { name?: string; description?: string; permissions?: Partial<ModulePermissions> },
     actorName: string,
     actorRole: string,
     allowAllTenants = false,
@@ -2255,10 +2269,12 @@ class FleetStore {
     if (patch.name) role.name = patch.name.trim();
     if (typeof patch.description === 'string') role.description = patch.description.trim();
     if (patch.permissions) {
-      role.permissions = {
-        ...role.permissions,
-        ...patch.permissions,
-      };
+      // Only known modules with a defined level; the request schema already rejects anything else.
+      for (const [module, level] of Object.entries(patch.permissions)) {
+        if (level && module in role.permissions) {
+          role.permissions[module as keyof ModulePermissions] = level;
+        }
+      }
     }
 
     this.addAuditLog({
@@ -2413,7 +2429,7 @@ class FleetStore {
     actorName: string,
     actorRole: string
   ): { vehicle: Vehicle; device: Device } {
-    const tenant = this.state.tenants.find((t) => t.id === tenantId) ?? this.state.tenants[0];
+    const tenant = this.state.tenants.find((t) => t.id === this.requireTenant(tenantId))!;
     const corridor = CORRIDORS.find((c) => c.branch === input.branch) ?? CORRIDORS[0];
     const num = this.state.vehicles.length + 1;
     const driverId = `drv-${uid()}`;
@@ -2894,9 +2910,7 @@ class FleetStore {
     actorRole: string,
     actorHidden = false
   ): PreventivePlan {
-    const resolvedTenantId = this.state.tenants.some((t) => t.id === tenantId)
-      ? tenantId
-      : this.state.tenants[0].id;
+    const resolvedTenantId = this.requireTenant(tenantId);
     const plan: PreventivePlan = {
       id: `pln-${resolvedTenantId}-${uid()}`,
       tenantId: resolvedTenantId,
@@ -3179,7 +3193,7 @@ class FleetStore {
     }
 
     this.addAuditLog({
-      tenantId: targetScope === 'all' ? this.state.tenants[0].id : targetScope,
+      tenantId: targetScope === 'all' ? GLOBAL_AUDIT_TENANT : targetScope,
       actorName,
       actorRole,
       actorHidden,
@@ -3208,9 +3222,7 @@ class FleetStore {
     actorRole: string,
     actorHidden = false
   ): PartInventoryItem {
-    const resolvedTenantId = this.state.tenants.some((t) => t.id === tenantId)
-      ? tenantId
-      : this.state.tenants[0].id;
+    const resolvedTenantId = this.requireTenant(tenantId);
     const normalizedSku = input.sku.trim().toUpperCase();
     const existing = this.state.partsInventory.find(
       (i) => i.tenantId === resolvedTenantId && i.sku.toUpperCase() === normalizedSku
@@ -3400,9 +3412,7 @@ class FleetStore {
     actorRole: string,
     actorHidden = false
   ): DashcamDriverProfile {
-    const resolvedTenantId = this.state.tenants.some((t) => t.id === tenantId)
-      ? tenantId
-      : this.state.tenants[0].id;
+    const resolvedTenantId = this.requireTenant(tenantId);
     const driver: DashcamDriverProfile = {
       id: `drv-custom-${uid()}`,
       vendorFamily: input.vendorFamily,
@@ -3758,9 +3768,7 @@ class FleetStore {
     actorRole: string,
     actorHidden = false
   ): AlertRule {
-    const resolvedTenantId = this.state.tenants.some((t) => t.id === tenantId)
-      ? tenantId
-      : this.state.tenants[0].id;
+    const resolvedTenantId = this.requireTenant(tenantId);
     const rule: AlertRule = {
       ...input,
       tenantId: resolvedTenantId,
@@ -3910,9 +3918,7 @@ class FleetStore {
     actorRole: string,
     actorHidden = false
   ): FleetStoreState['sizing'] {
-    const resolvedTenantId = this.state.tenants.some((t) => t.id === tenantId)
-      ? tenantId
-      : this.state.tenants[0].id;
+    const resolvedTenantId = GLOBAL_AUDIT_TENANT;
     this.state.sizing = {
       ...this.state.sizing,
       ...patch,

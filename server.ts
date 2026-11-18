@@ -4,7 +4,9 @@ import path from 'path';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import type { ModulePermissions, RoleDefinition, Tenant } from './src/shared/types.ts';
-import { fleetStore, type ActiveSession } from './server/store.ts';
+import { DomainError, fleetStore, type ActiveSession } from './server/store.ts';
+import * as schemas from './server/validation/schemas.ts';
+import { parseBody } from './server/validation/http.ts';
 
 const PORT = Number(process.env.PORT || 3000);
 
@@ -54,13 +56,19 @@ function getRequestedScope(req: express.Request, ctx: AuthContext): string | und
   return fromQuery || fromHeader || 'all';
 }
 
-function resolveTargetTenantId(req: express.Request, ctx: AuthContext): string {
+/**
+ * Company that a create operation targets. Regular users always write to their own company.
+ * The superadmin must name one (body.tenantId or the active scope); there is no silent default.
+ * Returns null after answering 400 when the superadmin didn't pick a valid company.
+ */
+function targetTenantOrFail(req: express.Request, res: express.Response, ctx: AuthContext): string | null {
   if (!ctx.user.isHiddenSuperadmin) return ctx.tenant.id;
   const bodyTenant = typeof req.body?.tenantId === 'string' ? req.body.tenantId.trim() : '';
   const scope = getRequestedScope(req, ctx);
   if (bodyTenant && bodyTenant !== 'all' && fleetStore.getTenantById(bodyTenant)) return bodyTenant;
   if (scope && scope !== 'all' && fleetStore.getTenantById(scope)) return scope;
-  return 'ten-norte';
+  res.status(400).json({ error: 'Selecciona la empresa destino antes de registrar este elemento.' });
+  return null;
 }
 
 async function startServer() {
@@ -115,13 +123,14 @@ async function startServer() {
   app.use('/api/auth', authLimiter);
 
   app.post('/api/auth/login', async (req, res) => {
-    const { username, password } = req.body ?? {};
-    if (!username || !password) {
+    const parsed = schemas.login.safeParse(req.body ?? {});
+    if (!parsed.success) {
       res.status(400).json({ error: 'Ingresa usuario y contraseña de la empresa.' });
       return;
     }
+    const { username, password } = parsed.data;
     try {
-      const result = await fleetStore.authenticate(String(username), String(password), {
+      const result = await fleetStore.authenticate(username, password, {
         ip: req.ip,
         userAgent: req.get('user-agent') ?? undefined,
       });
@@ -146,11 +155,9 @@ async function startServer() {
   app.post('/api/auth/change-password', async (req, res) => {
     const ctx = requireAuth(req, res);
     if (!ctx) return;
-    const { currentPassword, newPassword } = req.body ?? {};
-    if (typeof currentPassword !== 'string' || typeof newPassword !== 'string') {
-      res.status(400).json({ error: 'Indica la contraseña actual y la nueva.' });
-      return;
-    }
+    const body = parseBody(schemas.changePassword, req, res);
+    if (!body) return;
+    const { currentPassword, newPassword } = body;
     const result = await fleetStore.changeOwnPassword(
       ctx.user.id,
       ctx.session.tokenHash,
@@ -207,15 +214,14 @@ async function startServer() {
       res.status(403).json({ error: 'Solo el Admin de la empresa puede crear perfiles.' });
       return;
     }
-    const { name, description, permissions } = req.body ?? {};
-    if (!name || !permissions) {
-      res.status(400).json({ error: 'Nombre del perfil y matriz de permisos son obligatorios.' });
-      return;
-    }
-    const targetTenantId = resolveTargetTenantId(req, ctx);
+    const body = parseBody(schemas.createRole, req, res);
+    if (!body) return;
+    const { name, description, permissions } = body;
+    const targetTenantId = targetTenantOrFail(req, res, ctx);
+    if (!targetTenantId) return;
     const role = fleetStore.createRole(
       targetTenantId,
-      { name: String(name), description: String(description || ''), permissions },
+      { name, description, permissions },
       ctx.user.name,
       ctx.role.name,
       Boolean(ctx.user.isHiddenSuperadmin)
@@ -232,10 +238,12 @@ async function startServer() {
       return;
     }
     const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const body = parseBody(schemas.updateRole, req, res);
+    if (!body) return;
     const role = fleetStore.updateRole(
       ctx.tenant.id,
       req.params.id,
-      req.body ?? {},
+      body,
       ctx.user.name,
       ctx.role.name,
       isSuper,
@@ -257,15 +265,15 @@ async function startServer() {
       res.status(403).json({ error: 'Solo el Admin de la empresa puede crear usuarios.' });
       return;
     }
-    const { name, username, password, roleId } = req.body ?? {};
-    if (!name || !username || !roleId || !password) {
-      res.status(400).json({ error: 'Nombre, usuario, contraseña y perfil son obligatorios.' });
-      return;
-    }
+    const body = parseBody(schemas.createUser, req, res);
+    if (!body) return;
+    const targetTenantId = targetTenantOrFail(req, res, ctx);
+    if (!targetTenantId) return;
+    const { name, username, password, roleId } = body;
     const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
     const result = await fleetStore.createUser(
-      resolveTargetTenantId(req, ctx),
-      { name: String(name), username: String(username), password: String(password), roleId: String(roleId) },
+      targetTenantId,
+      { name, username, password, roleId },
       ctx.user.name,
       ctx.role.name,
       isSuper,
@@ -287,15 +295,12 @@ async function startServer() {
       return;
     }
     const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
-    const { roleId, status, password } = req.body ?? {};
+    const body = parseBody(schemas.updateUser, req, res);
+    if (!body) return;
     const updated = await fleetStore.updateUser(
       ctx.tenant.id,
       req.params.id,
-      {
-        roleId: typeof roleId === 'string' ? roleId : undefined,
-        status: status === 'activo' || status === 'inactivo' ? status : undefined,
-        password: typeof password === 'string' ? password : undefined,
-      },
+      body,
       ctx.user.name,
       ctx.role.name,
       isSuper,
@@ -321,12 +326,10 @@ async function startServer() {
       res.status(403).json({ error: 'Tu perfil no tiene permisos para registrar unidades.' });
       return;
     }
-    const body = req.body ?? {};
-    if (!body.unitCode || !body.plate || !body.imei || String(body.imei).length < 10) {
-      res.status(400).json({ error: 'Se requieren unidad, placa e IMEI válido (mínimo 10 dígitos).' });
-      return;
-    }
-    const targetTenantId = resolveTargetTenantId(req, ctx);
+    const body = parseBody(schemas.createVehicle, req, res);
+    if (!body) return;
+    const targetTenantId = targetTenantOrFail(req, res, ctx);
+    if (!targetTenantId) return;
     const targetTenant = fleetStore.getTenantById(targetTenantId) ?? ctx.tenant;
     const created = fleetStore.createVehicle(
       targetTenantId,
@@ -425,11 +428,9 @@ async function startServer() {
       res.status(403).json({ error: 'Tu perfil no tiene permisos para registrar mantenimientos.' });
       return;
     }
-    const { vehicleId, type, title, workshopOrTech, costMxn, notes, nextServiceDate, clearFaults } = req.body ?? {};
-    if (!vehicleId || !title) {
-      res.status(400).json({ error: 'Unidad y descripción del servicio son obligatorios.' });
-      return;
-    }
+    const body = parseBody(schemas.addMaintenance, req, res);
+    if (!body) return;
+    const { vehicleId, type, title, workshopOrTech, costMxn, notes, nextServiceDate, clearFaults } = body;
     const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
     const result = fleetStore.addMaintenanceRecord(
       ctx.tenant.id,
@@ -494,11 +495,8 @@ async function startServer() {
       res.status(403).json({ error: 'Tu perfil no tiene permisos para abrir órdenes de trabajo.' });
       return;
     }
-    const body = req.body ?? {};
-    if (!body.vehicleId || !body.title) {
-      res.status(400).json({ error: 'Unidad y título de la orden de trabajo son obligatorios.' });
-      return;
-    }
+    const body = parseBody(schemas.createWorkOrder, req, res);
+    if (!body) return;
     const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
     const workOrder = fleetStore.createWorkOrder(
       ctx.tenant.id,
@@ -513,7 +511,7 @@ async function startServer() {
         title: String(body.title),
         workshopOrTech: String(body.workshopOrTech || 'Taller Central Certificado'),
         scheduledDate: String(body.scheduledDate || new Date().toISOString().slice(0, 10)),
-        parts: Array.isArray(body.parts) ? body.parts : [],
+        parts: body.parts ?? [],
         laborCostMxn: Number(body.laborCostMxn || 0),
         notes: String(body.notes || ''),
         clearFaultsOnClose: Boolean(body.clearFaultsOnClose ?? true),
@@ -545,10 +543,12 @@ async function startServer() {
       return;
     }
     const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const body = parseBody(schemas.updateWorkOrder, req, res);
+    if (!body) return;
     const result = fleetStore.updateWorkOrder(
       ctx.tenant.id,
       req.params.id,
-      req.body ?? {},
+      body,
       ctx.user.name,
       ctx.role.name,
       isSuper,
@@ -577,13 +577,12 @@ async function startServer() {
       res.status(403).json({ error: 'Tu perfil no tiene permisos para crear planes preventivos.' });
       return;
     }
-    const body = req.body ?? {};
-    if (!body.name) {
-      res.status(400).json({ error: 'El nombre del plan preventivo es obligatorio.' });
-      return;
-    }
+    const body = parseBody(schemas.createPreventivePlan, req, res);
+    if (!body) return;
+    const targetTenantId = targetTenantOrFail(req, res, ctx);
+    if (!targetTenantId) return;
     const plan = fleetStore.createPreventivePlan(
-      resolveTargetTenantId(req, ctx),
+      targetTenantId,
       {
         name: String(body.name),
         assetType:
@@ -642,10 +641,12 @@ async function startServer() {
       return;
     }
     const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const body = parseBody(schemas.updatePreventivePlan, req, res);
+    if (!body) return;
     const plan = fleetStore.updatePreventivePlan(
       ctx.tenant.id,
       req.params.id,
-      req.body ?? {},
+      body,
       ctx.user.name,
       ctx.role.name,
       isSuper,
@@ -670,12 +671,9 @@ async function startServer() {
       res.status(403).json({ error: 'Tu perfil no tiene permisos para asignar planes preventivos.' });
       return;
     }
-    const body = req.body ?? {};
-    const vehicleIds = Array.isArray(body.vehicleIds) ? body.vehicleIds.map(String) : [];
-    if (vehicleIds.length === 0) {
-      res.status(400).json({ error: 'Selecciona al menos una unidad para asignar el plan.' });
-      return;
-    }
+    const body = parseBody(schemas.assignPreventivePlan, req, res);
+    if (!body) return;
+    const vehicleIds = body.vehicleIds;
     const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
     const result = fleetStore.assignPreventivePlanToVehicles(
       ctx.tenant.id,
@@ -733,13 +731,12 @@ async function startServer() {
       res.status(403).json({ error: 'Tu perfil no tiene permisos para administrar el almacén de refacciones.' });
       return;
     }
-    const body = req.body ?? {};
-    if (!body.sku || !body.name) {
-      res.status(400).json({ error: 'SKU y nombre de refacción/insumo son obligatorios.' });
-      return;
-    }
+    const body = parseBody(schemas.upsertPart, req, res);
+    if (!body) return;
+    const targetTenantId = targetTenantOrFail(req, res, ctx);
+    if (!targetTenantId) return;
     const item = fleetStore.upsertPartInventoryItem(
-      resolveTargetTenantId(req, ctx),
+      targetTenantId,
       {
         sku: String(body.sku),
         name: String(body.name),
@@ -770,12 +767,9 @@ async function startServer() {
       res.status(403).json({ error: 'Tu perfil no tiene permisos para ajustar existencias de almacén.' });
       return;
     }
-    const body = req.body ?? {};
-    const deltaQty = Number(body.deltaQty);
-    if (!Number.isFinite(deltaQty) || deltaQty === 0) {
-      res.status(400).json({ error: 'Cantidad de ajuste (deltaQty) inválida.' });
-      return;
-    }
+    const body = parseBody(schemas.adjustStock, req, res);
+    if (!body) return;
+    const deltaQty = body.deltaQty;
     const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
     const item = fleetStore.adjustPartInventoryStock(
       ctx.tenant.id,
@@ -807,11 +801,8 @@ async function startServer() {
       res.status(403).json({ error: 'Tu perfil no tiene permisos para registrar checklists pre-operativos.' });
       return;
     }
-    const body = req.body ?? {};
-    if (!body.vehicleId || !Array.isArray(body.items) || body.items.length === 0) {
-      res.status(400).json({ error: 'Unidad y puntos de verificación son obligatorios.' });
-      return;
-    }
+    const body = parseBody(schemas.createChecklist, req, res);
+    if (!body) return;
     const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
     const result = fleetStore.createPreOpChecklist(
       ctx.tenant.id,
@@ -850,13 +841,12 @@ async function startServer() {
       res.status(403).json({ error: 'Solo Superadmin y Admin de Empresa (o perfil autorizado) pueden registrar drivers de dashcams.' });
       return;
     }
-    const body = req.body ?? {};
-    if (!body.vendorName || !body.modelSeries || !body.driverCode) {
-      res.status(400).json({ error: 'Fabricante, serie de equipo y código de driver son obligatorios.' });
-      return;
-    }
+    const body = parseBody(schemas.createDashcamDriver, req, res);
+    if (!body) return;
+    const targetTenantId = targetTenantOrFail(req, res, ctx);
+    if (!targetTenantId) return;
     const driver = fleetStore.createDashcamDriver(
-      resolveTargetTenantId(req, ctx),
+      targetTenantId,
       {
         vendorFamily:
           body.vendorFamily === 'jimi_concox' ||
@@ -906,15 +896,12 @@ async function startServer() {
       });
       return;
     }
-    const body = req.body ?? {};
-    if (!Array.isArray(body.deviceIds) || body.deviceIds.length === 0 || !body.driverId) {
-      res.status(400).json({ error: 'Selecciona al menos una unidad y un driver de dashcam válido.' });
-      return;
-    }
+    const body = parseBody(schemas.batchDashcamConfig, req, res);
+    if (!body) return;
     const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
     const updated = fleetStore.batchUpdateDeviceDashcamConfig(
       ctx.tenant.id,
-      body.deviceIds.map(String),
+      body.deviceIds,
       {
         driverId: String(body.driverId),
         tcpPort: Number(body.tcpPort || 6808),
@@ -966,11 +953,8 @@ async function startServer() {
       res.status(403).json({ error: 'Acceso restringido: solo Superadmin, Admin de Empresa o perfiles autorizados pueden configurar drivers y prestaciones de dashcams.' });
       return;
     }
-    const body = req.body ?? {};
-    if (!body.driverId) {
-      res.status(400).json({ error: 'Selecciona un driver de dashcam válido.' });
-      return;
-    }
+    const body = parseBody(schemas.updateDashcamConfig, req, res);
+    if (!body) return;
     const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
     const device = fleetStore.updateDeviceDashcamConfig(
       ctx.tenant.id,
@@ -1082,10 +1066,12 @@ async function startServer() {
       return;
     }
     const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const body = parseBody(schemas.updateIncident, req, res);
+    if (!body) return;
     const incident = fleetStore.updateIncident(
       ctx.tenant.id,
       req.params.id,
-      req.body ?? {},
+      body,
       ctx.user.name,
       ctx.role.name,
       isSuper,
@@ -1110,18 +1096,17 @@ async function startServer() {
       res.status(403).json({ error: 'Tu perfil no puede crear reglas.' });
       return;
     }
-    const body = req.body ?? {};
-    if (!body.name || !body.thresholdLabel) {
-      res.status(400).json({ error: 'Nombre de regla y umbral son obligatorios.' });
-      return;
-    }
+    const body = parseBody(schemas.createAlertRule, req, res);
+    if (!body) return;
+    const targetTenantId = targetTenantOrFail(req, res, ctx);
+    if (!targetTenantId) return;
     const rule = fleetStore.createRule(
-      resolveTargetTenantId(req, ctx),
+      targetTenantId,
       {
         name: String(body.name),
-        conditionType: body.conditionType || 'velocidad',
+        conditionType: body.conditionType ?? 'velocidad',
         thresholdLabel: String(body.thresholdLabel),
-        priority: body.priority || 'alta',
+        priority: body.priority ?? 'alta',
         autoCreateClip: Boolean(body.autoCreateClip ?? true),
         active: true,
         notifyQueue: String(body.notifyQueue || 'rabbitmq.alerts.high'),
@@ -1165,12 +1150,13 @@ async function startServer() {
       res.status(403).json({ error: 'Tu perfil no puede solicitar transmisiones bajo demanda.' });
       return;
     }
-    const { vehicleId, channel } = req.body ?? {};
+    const body = parseBody(schemas.requestStream, req, res);
+    if (!body) return;
     const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
     const clip = fleetStore.requestOnDemandClip(
       ctx.tenant.id,
-      String(vehicleId || ''),
-      channel === 'ch1_frontal' || channel === 'ch2_cabina' ? channel : 'dual',
+      body.vehicleId,
+      body.channel ?? 'dual',
       ctx.user.name,
       ctx.role.name,
       isSuper,
@@ -1211,13 +1197,17 @@ async function startServer() {
   app.put('/api/sizing', (req, res) => {
     const ctx = requireAuth(req, res);
     if (!ctx) return;
-    if (!hasWritePermission(ctx.role, 'dimensionamiento')) {
-      res.status(403).json({ error: 'Tu perfil no tiene permisos de dimensionamiento.' });
+    if (!ctx.user.isHiddenSuperadmin) {
+      res.status(403).json({
+        error: 'El dimensionamiento de la plataforma es global; solo el Superadmin puede modificarlo.',
+      });
       return;
     }
+    const body = parseBody(schemas.updateSizing, req, res);
+    if (!body) return;
     const sizing = fleetStore.updateSizing(
-      resolveTargetTenantId(req, ctx),
-      req.body ?? {},
+      'global',
+      body,
       ctx.user.name,
       ctx.role.name,
       Boolean(ctx.user.isHiddenSuperadmin)
@@ -1262,6 +1252,20 @@ async function startServer() {
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${exportScopeName}_flota_mantenimiento.csv"`);
     res.send(header + rows);
+  });
+
+  app.use('/api', (err: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (res.headersSent) return next(err);
+    if (err instanceof DomainError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
+    if (err instanceof SyntaxError && 'body' in err) {
+      res.status(400).json({ error: 'El cuerpo de la petición no es JSON válido.' });
+      return;
+    }
+    console.error(`[api] ${req.method} ${req.originalUrl}:`, err);
+    res.status(500).json({ error: 'Error interno del servidor.' });
   });
 
   if (isProd) {

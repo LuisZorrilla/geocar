@@ -6,6 +6,8 @@ import { Pagination, usePagination } from './Pagination.tsx';
 interface SizingRoadmapViewProps {
   sizing: SizingConfig;
   activeRole: RoleDefinition;
+  /** Sizing is a platform-wide setting: only the global superadmin may change it. */
+  isGlobalSuperadmin: boolean;
   onSaveSizing: (patch: Partial<SizingConfig>) => Promise<void>;
 }
 
@@ -18,12 +20,13 @@ const STAGE_STATUS_META = {
 export function SizingRoadmapView({
   sizing,
   activeRole,
+  isGlobalSuperadmin,
   onSaveSizing,
 }: SizingRoadmapViewProps) {
   const [draft, setDraft] = useState<SizingConfig>(sizing);
   const [saving, setSaving] = useState(false);
 
-  const canSave = activeRole.permissions.dimensionamiento === 'full';
+  const canSave = isGlobalSuperadmin && activeRole.permissions.dimensionamiento === 'full';
   const stagesPagination = usePagination(sizing.stages, `${sizing.stages.length}`, 5);
 
   const metrics = useMemo(() => {

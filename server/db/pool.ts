@@ -10,7 +10,7 @@ export function getPool(): pg.Pool {
       'DATABASE_URL no está definido. Copia .env.example a .env y configura la conexión a PostgreSQL.'
     );
   }
-  pool = new pg.Pool({ connectionString, max: 10 });
+  pool = new pg.Pool({ connectionString, max: Number(process.env.PG_POOL_MAX || 10) });
   pool.on('error', (err) => console.error('[db] Error inesperado en el pool:', err));
   return pool;
 }
