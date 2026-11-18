@@ -12,7 +12,9 @@
     "lint": "tsc --noEmit",
     "db:migrate": "tsx server/db/cli.ts migrate",
     "db:reset": "tsx server/db/cli.ts reset",
-    "test": "tsx --test --test-concurrency=1 tests/*.test.ts"
+    "test": "tsx --test --test-concurrency=1 tests/*.test.ts",
+    "gateway": "tsx gateway/server.ts",
+    "gateway:sim": "tsx gateway/simulator.ts"
   },
   "dependencies": {
     "@arcgis/core": "^5.2.6",
