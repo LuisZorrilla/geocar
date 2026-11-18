@@ -1,0 +1,1206 @@
+import express from 'express';
+import path from 'path';
+import type { ModulePermissions, RoleDefinition, Tenant } from './src/shared/types.ts';
+import { fleetStore, type ActiveSession } from './server/store.ts';
+
+const PORT = 3000;
+
+interface AuthContext {
+  session: ActiveSession;
+  tenant: Tenant;
+  user: {
+    id: string;
+    name: string;
+    username: string;
+    tenantId: string;
+    roleId: string;
+    isCompanyAdmin: boolean;
+    isHiddenSuperadmin?: boolean;
+  };
+  role: RoleDefinition;
+}
+
+function extractToken(req: express.Request): string | undefined {
+  const auth = req.headers.authorization;
+  if (typeof auth === 'string' && auth.startsWith('Bearer ')) {
+    return auth.slice(7).trim();
+  }
+  if (typeof req.query.token === 'string' && req.query.token.trim()) {
+    return req.query.token.trim();
+  }
+  return undefined;
+}
+
+function requireAuth(req: express.Request, res: express.Response): AuthContext | null {
+  const token = extractToken(req);
+  const resolved = fleetStore.resolveSession(token);
+  if (!resolved) {
+    res.status(401).json({ error: 'Sesión no válida o expirada. Inicia sesión nuevamente.' });
+    return null;
+  }
+  return resolved;
+}
+
+function hasWritePermission(role: RoleDefinition, module: keyof ModulePermissions): boolean {
+  const lvl = role.permissions[module];
+  return lvl === 'full' || lvl === 'write';
+}
+
+function getRequestedScope(req: express.Request, ctx: AuthContext): string | undefined {
+  if (!ctx.user.isHiddenSuperadmin) return undefined;
+  const fromQuery = typeof req.query.scopeTenantId === 'string' ? req.query.scopeTenantId.trim() : '';
+  const fromHeader = typeof req.headers['x-tenant-scope'] === 'string' ? req.headers['x-tenant-scope'].trim() : '';
+  return fromQuery || fromHeader || 'all';
+}
+
+function resolveTargetTenantId(req: express.Request, ctx: AuthContext): string {
+  if (!ctx.user.isHiddenSuperadmin) return ctx.tenant.id;
+  const bodyTenant = typeof req.body?.tenantId === 'string' ? req.body.tenantId.trim() : '';
+  const scope = getRequestedScope(req, ctx);
+  if (bodyTenant && bodyTenant !== 'all' && fleetStore.getTenantById(bodyTenant)) return bodyTenant;
+  if (scope && scope !== 'all' && fleetStore.getTenantById(scope)) return scope;
+  return 'ten-norte';
+}
+
+async function startServer() {
+  const app = express();
+  app.use(express.json());
+
+  // Public auth routes (never expose superadmin)
+  app.get('/api/auth/demo-accounts', (_req, res) => {
+    res.json({ accounts: fleetStore.getDemoLoginAccounts() });
+  });
+
+  app.post('/api/auth/login', (req, res) => {
+    const { username, password } = req.body ?? {};
+    if (!username || !password) {
+      res.status(400).json({ error: 'Ingresa usuario y contraseña de la empresa.' });
+      return;
+    }
+    const auth = fleetStore.authenticate(String(username), String(password));
+    if (!auth) {
+      res.status(401).json({ error: 'Credenciales inválidas o cuenta inactiva.' });
+      return;
+    }
+    res.json(auth);
+  });
+
+  app.post('/api/auth/logout', (req, res) => {
+    const token = extractToken(req);
+    if (token) fleetStore.revokeSession(token);
+    res.json({ ok: true });
+  });
+
+  // Protected tenant-isolated bootstrap (or global scope for superadmin)
+  app.get('/api/bootstrap', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    const scope = getRequestedScope(req, ctx);
+    const payload = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, scope);
+    if (!payload) {
+      res.status(404).json({ error: 'Empresa o usuario no disponible.' });
+      return;
+    }
+    res.json(payload);
+  });
+
+  app.post('/api/telemetry/tick', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    const scope = getRequestedScope(req, ctx);
+    const vehicles = fleetStore.tickTelemetry(ctx.tenant.id, scope);
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, scope);
+    res.json({
+      vehicles,
+      workOrders: data?.workOrders ?? [],
+      maintenanceDashboard: data?.maintenanceDashboard,
+      updatedAt: new Date().toISOString(),
+    });
+  });
+
+  app.get('/api/maintenance/dashboard', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    const scope = getRequestedScope(req, ctx);
+    const metrics = fleetStore.getMaintenanceDashboardMetrics(ctx.tenant.id, scope);
+    res.json(metrics);
+  });
+
+  // Company Admin: Custom Profiles & Permissions
+  app.post('/api/roles', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!ctx.user.isCompanyAdmin && ctx.role.permissions.administracion !== 'full') {
+      res.status(403).json({ error: 'Solo el Admin de la empresa puede crear perfiles.' });
+      return;
+    }
+    const { name, description, permissions } = req.body ?? {};
+    if (!name || !permissions) {
+      res.status(400).json({ error: 'Nombre del perfil y matriz de permisos son obligatorios.' });
+      return;
+    }
+    const targetTenantId = resolveTargetTenantId(req, ctx);
+    const role = fleetStore.createRole(
+      targetTenantId,
+      { name: String(name), description: String(description || ''), permissions },
+      ctx.user.name,
+      ctx.role.name,
+      Boolean(ctx.user.isHiddenSuperadmin)
+    );
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.status(201).json({ role, roles: data?.roles ?? [], auditLogs: data?.auditLogs ?? [] });
+  });
+
+  app.patch('/api/roles/:id', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!ctx.user.isCompanyAdmin && ctx.role.permissions.administracion !== 'full') {
+      res.status(403).json({ error: 'Solo el Admin de la empresa puede editar perfiles.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const role = fleetStore.updateRole(
+      ctx.tenant.id,
+      req.params.id,
+      req.body ?? {},
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!role) {
+      res.status(404).json({ error: 'Perfil no encontrado o protegido.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.json({ role, roles: data?.roles ?? [], auditLogs: data?.auditLogs ?? [] });
+  });
+
+  // Company Admin: Users (strictly excludes superadmin)
+  app.post('/api/users', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!ctx.user.isCompanyAdmin && ctx.role.permissions.administracion !== 'full') {
+      res.status(403).json({ error: 'Solo el Admin de la empresa puede crear usuarios.' });
+      return;
+    }
+    const { name, username, password, roleId } = req.body ?? {};
+    if (!name || !username || !roleId) {
+      res.status(400).json({ error: 'Nombre, usuario y perfil son obligatorios.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const result = fleetStore.createUser(
+      resolveTargetTenantId(req, ctx),
+      { name: String(name), username: String(username), password: String(password || 'Clave2026!'), roleId: String(roleId) },
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (result.error || !result.user) {
+      res.status(400).json({ error: result.error || 'No se pudo crear el usuario.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.status(201).json({ user: result.user, users: data?.users ?? [], auditLogs: data?.auditLogs ?? [] });
+  });
+
+  app.patch('/api/users/:id', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!ctx.user.isCompanyAdmin && ctx.role.permissions.administracion !== 'full') {
+      res.status(403).json({ error: 'Solo el Admin de la empresa puede actualizar usuarios.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const updated = fleetStore.updateUser(
+      ctx.tenant.id,
+      req.params.id,
+      req.body ?? {},
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!updated) {
+      res.status(404).json({ error: 'Usuario no encontrado en esta empresa.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.json({ user: updated, users: data?.users ?? [], auditLogs: data?.auditLogs ?? [] });
+  });
+
+  // Vehicles & Heavy Machinery
+  app.post('/api/vehicles', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'flotas')) {
+      res.status(403).json({ error: 'Tu perfil no tiene permisos para registrar unidades.' });
+      return;
+    }
+    const body = req.body ?? {};
+    if (!body.unitCode || !body.plate || !body.imei || String(body.imei).length < 10) {
+      res.status(400).json({ error: 'Se requieren unidad, placa e IMEI válido (mínimo 10 dígitos).' });
+      return;
+    }
+    const targetTenantId = resolveTargetTenantId(req, ctx);
+    const targetTenant = fleetStore.getTenantById(targetTenantId) ?? ctx.tenant;
+    const created = fleetStore.createVehicle(
+      targetTenantId,
+      {
+        branch: String(body.branch || targetTenant.branches[0]),
+        group: String(body.group || 'Operación General'),
+        assetType: body.assetType === 'maquinaria_pesada' ? 'maquinaria_pesada' : 'vehiculo',
+        unitCode: String(body.unitCode),
+        plate: String(body.plate),
+        brandModel: String(body.brandModel || 'Kenworth T680'),
+        year: Number(body.year || 2025),
+        driverName: String(body.driverName || 'Operador Asignado'),
+        imei: String(body.imei),
+        protocol: body.protocol === 'Traccar' ? 'Traccar' : 'JT808/JT1078',
+        deviceModel: String(body.deviceModel || 'Howen Hero-ME40-04'),
+        engineHours: Number(body.engineHours || 120),
+        odometerKm: Number(body.odometerKm || 1200),
+      },
+      ctx.user.name,
+      ctx.role.name
+    );
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.status(201).json({ ...created, auditLogs: data?.auditLogs ?? [] });
+  });
+
+  app.get('/api/vehicles/:id/dossier', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    const dossier = fleetStore.getVehicleDossier(
+      ctx.tenant.id,
+      req.params.id,
+      Boolean(ctx.user.isHiddenSuperadmin)
+    );
+    if (!dossier) {
+      res.status(404).json({ error: 'Unidad no encontrada en tu empresa.' });
+      return;
+    }
+    res.json(dossier);
+  });
+
+  app.get('/api/vehicles/:id/export', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    const dossier = fleetStore.getVehicleDossier(
+      ctx.tenant.id,
+      req.params.id,
+      Boolean(ctx.user.isHiddenSuperadmin)
+    );
+    if (!dossier) {
+      res.status(404).json({ error: 'Unidad no encontrada.' });
+      return;
+    }
+    const tenantName = fleetStore.getTenantById(dossier.vehicle.tenantId)?.name ?? ctx.tenant.name;
+    const format = req.query.format === 'json' ? 'json' : 'csv';
+    if (format === 'json') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${dossier.vehicle.unitCode}_ficha_operativa.json"`);
+      res.send(JSON.stringify({ empresa: tenantName, exportadoEn: new Date().toISOString(), ...dossier }, null, 2));
+      return;
+    }
+    const v = dossier.vehicle;
+    const faultsStr = v.faultCodes.map((f) => `${f.code}: ${f.description}`).join(' | ') || 'Sin fallas';
+    const header =
+      'Unidad,Tipo_Activo,Placa,Marca_Modelo,Empresa,Sucursal,Conductor,Estado_Operativo,Horometro_h,Proximo_Servicio_h,Proximo_Servicio_Fecha,Odometro_km,Proximo_Servicio_km,Estado_Mantenimiento,Combustible_pct,RPM,Temp_C,Codigos_Falla,Lat,Lng\n';
+    const row = [
+      v.unitCode,
+      v.assetType,
+      v.plate,
+      `"${v.brandModel}"`,
+      `"${tenantName}"`,
+      `"${v.branch}"`,
+      `"${v.driverName}"`,
+      v.operationalStatus,
+      v.engineHours,
+      v.nextServiceHours,
+      v.nextServiceDate,
+      v.odometerKm,
+      v.nextServiceKm,
+      v.maintenanceStatus,
+      v.fuelLevelPct,
+      v.rpm,
+      v.coolantTempC,
+      `"${faultsStr}"`,
+      v.lat,
+      v.lng,
+    ].join(',');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${v.unitCode}_ficha_mantenimiento.csv"`);
+    res.send(header + row);
+  });
+
+  app.post('/api/maintenance', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'flotas')) {
+      res.status(403).json({ error: 'Tu perfil no tiene permisos para registrar mantenimientos.' });
+      return;
+    }
+    const { vehicleId, type, title, workshopOrTech, costMxn, notes, nextServiceDate, clearFaults } = req.body ?? {};
+    if (!vehicleId || !title) {
+      res.status(400).json({ error: 'Unidad y descripción del servicio son obligatorios.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const result = fleetStore.addMaintenanceRecord(
+      ctx.tenant.id,
+      String(vehicleId),
+      {
+        type: type === 'correctivo' || type === 'inspeccion' ? type : 'preventivo',
+        title: String(title),
+        workshopOrTech: String(workshopOrTech || 'Taller Interno'),
+        costMxn: Number(costMxn || 0),
+        notes: String(notes || ''),
+        nextServiceDate: typeof nextServiceDate === 'string' ? nextServiceDate : undefined,
+        clearFaults: Boolean(clearFaults),
+      },
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!result) {
+      res.status(404).json({ error: 'Unidad no encontrada en tu empresa.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.status(201).json({
+      ...result,
+      maintenanceRecords: data?.maintenanceRecords ?? [],
+      partsInventory: data?.partsInventory ?? [],
+      maintenanceDashboard: data?.maintenanceDashboard,
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
+  app.post('/api/devices/:id/validate', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'dispositivos')) {
+      res.status(403).json({ error: 'Tu perfil no tiene permisos para validar dispositivos.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const dev = fleetStore.validateDevice(
+      ctx.tenant.id,
+      req.params.id,
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!dev) {
+      res.status(404).json({ error: 'Dispositivo no encontrado en tu empresa.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.json({ device: dev, auditLogs: data?.auditLogs ?? [] });
+  });
+
+  // Full Fleet Maintenance: Work Orders, Preventive Plans & Pre-Op Checklists
+  app.post('/api/work-orders', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'flotas')) {
+      res.status(403).json({ error: 'Tu perfil no tiene permisos para abrir órdenes de trabajo.' });
+      return;
+    }
+    const body = req.body ?? {};
+    if (!body.vehicleId || !body.title) {
+      res.status(400).json({ error: 'Unidad y título de la orden de trabajo son obligatorios.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const workOrder = fleetStore.createWorkOrder(
+      ctx.tenant.id,
+      {
+        vehicleId: String(body.vehicleId),
+        planId: typeof body.planId === 'string' && body.planId ? body.planId : undefined,
+        type: body.type === 'correctivo' || body.type === 'inspeccion' ? body.type : 'preventivo',
+        priority:
+          body.priority === 'baja' || body.priority === 'alta' || body.priority === 'critica'
+            ? body.priority
+            : 'media',
+        title: String(body.title),
+        workshopOrTech: String(body.workshopOrTech || 'Taller Central Certificado'),
+        scheduledDate: String(body.scheduledDate || new Date().toISOString().slice(0, 10)),
+        parts: Array.isArray(body.parts) ? body.parts : [],
+        laborCostMxn: Number(body.laborCostMxn || 0),
+        notes: String(body.notes || ''),
+        clearFaultsOnClose: Boolean(body.clearFaultsOnClose ?? true),
+      },
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!workOrder) {
+      res.status(404).json({ error: 'Unidad no encontrada en tu empresa.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.status(201).json({
+      workOrder,
+      workOrders: data?.workOrders ?? [],
+      partsInventory: data?.partsInventory ?? [],
+      maintenanceDashboard: data?.maintenanceDashboard,
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
+  app.patch('/api/work-orders/:id', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'flotas')) {
+      res.status(403).json({ error: 'Tu perfil no tiene permisos para actualizar órdenes de trabajo.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const result = fleetStore.updateWorkOrder(
+      ctx.tenant.id,
+      req.params.id,
+      req.body ?? {},
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!result) {
+      res.status(404).json({ error: 'Orden de trabajo no encontrada en tu empresa.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.json({
+      ...result,
+      workOrders: data?.workOrders ?? [],
+      vehicles: data?.vehicles ?? [],
+      maintenanceRecords: data?.maintenanceRecords ?? [],
+      partsInventory: data?.partsInventory ?? [],
+      maintenanceDashboard: data?.maintenanceDashboard,
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
+  app.post('/api/preventive-plans', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'flotas')) {
+      res.status(403).json({ error: 'Tu perfil no tiene permisos para crear planes preventivos.' });
+      return;
+    }
+    const body = req.body ?? {};
+    if (!body.name) {
+      res.status(400).json({ error: 'El nombre del plan preventivo es obligatorio.' });
+      return;
+    }
+    const plan = fleetStore.createPreventivePlan(
+      resolveTargetTenantId(req, ctx),
+      {
+        name: String(body.name),
+        assetType:
+          body.assetType === 'vehiculo' || body.assetType === 'maquinaria_pesada' ? body.assetType : 'ambos',
+        intervalHours: Number(body.intervalHours || 250),
+        intervalKm: Number(body.intervalKm || 10000),
+        intervalDays: Number(body.intervalDays || 45),
+        estimatedCostMxn: Number(body.estimatedCostMxn || 0),
+        checklistFocus: String(body.checklistFocus || 'Inspección general preventiva.'),
+      },
+      ctx.user.name,
+      ctx.role.name,
+      Boolean(ctx.user.isHiddenSuperadmin)
+    );
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.status(201).json({
+      plan,
+      preventivePlans: data?.preventivePlans ?? [],
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
+  app.patch('/api/preventive-plans/:id/toggle', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'flotas')) {
+      res.status(403).json({ error: 'Tu perfil no tiene permisos para modificar planes preventivos.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const plan = fleetStore.togglePreventivePlan(
+      ctx.tenant.id,
+      req.params.id,
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!plan) {
+      res.status(404).json({ error: 'Plan preventivo no encontrado.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.json({
+      plan,
+      preventivePlans: data?.preventivePlans ?? [],
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
+  app.patch('/api/preventive-plans/:id', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'flotas')) {
+      res.status(403).json({ error: 'Tu perfil no tiene permisos para editar planes preventivos.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const plan = fleetStore.updatePreventivePlan(
+      ctx.tenant.id,
+      req.params.id,
+      req.body ?? {},
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!plan) {
+      res.status(404).json({ error: 'Plan preventivo no encontrado en tu empresa.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.json({
+      plan,
+      preventivePlans: data?.preventivePlans ?? [],
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
+  app.post('/api/preventive-plans/:id/assign', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'flotas')) {
+      res.status(403).json({ error: 'Tu perfil no tiene permisos para asignar planes preventivos.' });
+      return;
+    }
+    const body = req.body ?? {};
+    const vehicleIds = Array.isArray(body.vehicleIds) ? body.vehicleIds.map(String) : [];
+    if (vehicleIds.length === 0) {
+      res.status(400).json({ error: 'Selecciona al menos una unidad para asignar el plan.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const result = fleetStore.assignPreventivePlanToVehicles(
+      ctx.tenant.id,
+      req.params.id,
+      vehicleIds,
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!result) {
+      res.status(404).json({ error: 'Plan preventivo no encontrado en tu empresa.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.json({
+      ...result,
+      vehicles: data?.vehicles ?? [],
+      workOrders: data?.workOrders ?? [],
+      preventivePlans: data?.preventivePlans ?? [],
+      maintenanceDashboard: data?.maintenanceDashboard,
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
+  app.post('/api/maintenance/evaluate-plans', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'flotas')) {
+      res.status(403).json({ error: 'Tu perfil no tiene permisos para ejecutar evaluación de planes preventivos.' });
+      return;
+    }
+    const scope = getRequestedScope(req, ctx);
+    const summary = fleetStore.runPreventiveAutoDispatch(
+      ctx.tenant.id,
+      scope,
+      ctx.user.name,
+      ctx.role.name,
+      Boolean(ctx.user.isHiddenSuperadmin)
+    );
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, scope);
+    res.json({
+      ...summary,
+      vehicles: data?.vehicles ?? [],
+      workOrders: data?.workOrders ?? [],
+      maintenanceDashboard: data?.maintenanceDashboard,
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
+  app.post('/api/parts-inventory', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'flotas')) {
+      res.status(403).json({ error: 'Tu perfil no tiene permisos para administrar el almacén de refacciones.' });
+      return;
+    }
+    const body = req.body ?? {};
+    if (!body.sku || !body.name) {
+      res.status(400).json({ error: 'SKU y nombre de refacción/insumo son obligatorios.' });
+      return;
+    }
+    const item = fleetStore.upsertPartInventoryItem(
+      resolveTargetTenantId(req, ctx),
+      {
+        sku: String(body.sku),
+        name: String(body.name),
+        category: body.category === 'insumo' ? 'insumo' : 'refaccion',
+        unit: String(body.unit || 'pza'),
+        stockQty: Number(body.stockQty ?? 0),
+        minStock: Number(body.minStock ?? 2),
+        unitCostMxn: Number(body.unitCostMxn ?? 0),
+        warehouseLocation: String(body.warehouseLocation || 'Almacén Central'),
+      },
+      ctx.user.name,
+      ctx.role.name,
+      Boolean(ctx.user.isHiddenSuperadmin)
+    );
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.status(201).json({
+      item,
+      partsInventory: data?.partsInventory ?? [],
+      maintenanceDashboard: data?.maintenanceDashboard,
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
+  app.patch('/api/parts-inventory/:id/stock', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'flotas')) {
+      res.status(403).json({ error: 'Tu perfil no tiene permisos para ajustar existencias de almacén.' });
+      return;
+    }
+    const body = req.body ?? {};
+    const deltaQty = Number(body.deltaQty);
+    if (!Number.isFinite(deltaQty) || deltaQty === 0) {
+      res.status(400).json({ error: 'Cantidad de ajuste (deltaQty) inválida.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const item = fleetStore.adjustPartInventoryStock(
+      ctx.tenant.id,
+      req.params.id,
+      deltaQty,
+      String(body.reason || 'Reabasto en taller'),
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!item) {
+      res.status(404).json({ error: 'SKU no encontrado en el almacén de tu empresa.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.json({
+      item,
+      partsInventory: data?.partsInventory ?? [],
+      maintenanceDashboard: data?.maintenanceDashboard,
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
+  app.post('/api/checklists', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'flotas') && ctx.role.permissions.monitoreo !== 'full') {
+      res.status(403).json({ error: 'Tu perfil no tiene permisos para registrar checklists pre-operativos.' });
+      return;
+    }
+    const body = req.body ?? {};
+    if (!body.vehicleId || !Array.isArray(body.items) || body.items.length === 0) {
+      res.status(400).json({ error: 'Unidad y puntos de verificación son obligatorios.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const result = fleetStore.createPreOpChecklist(
+      ctx.tenant.id,
+      {
+        vehicleId: String(body.vehicleId),
+        driverName: String(body.driverName || ''),
+        shift: body.shift === 'Vespertino' || body.shift === 'Nocturno' ? body.shift : 'Matutino',
+        items: body.items,
+        summaryNote: String(body.summaryNote || ''),
+        createWorkOrderIfFailed: Boolean(body.createWorkOrderIfFailed),
+      },
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!result) {
+      res.status(404).json({ error: 'Unidad no encontrada en tu empresa.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.status(201).json({
+      ...result,
+      checklists: data?.checklists ?? [],
+      workOrders: data?.workOrders ?? [],
+      maintenanceDashboard: data?.maintenanceDashboard,
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
+  // Dashcam Drivers & Capabilities Configuration (Exclusive Superadmin & Company Admin / Authorized Roles)
+  app.post('/api/dashcam-drivers', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!ctx.user.isHiddenSuperadmin && !hasWritePermission(ctx.role, 'dashcams_config')) {
+      res.status(403).json({ error: 'Solo Superadmin y Admin de Empresa (o perfil autorizado) pueden registrar drivers de dashcams.' });
+      return;
+    }
+    const body = req.body ?? {};
+    if (!body.vendorName || !body.modelSeries || !body.driverCode) {
+      res.status(400).json({ error: 'Fabricante, serie de equipo y código de driver son obligatorios.' });
+      return;
+    }
+    const driver = fleetStore.createDashcamDriver(
+      resolveTargetTenantId(req, ctx),
+      {
+        vendorFamily:
+          body.vendorFamily === 'jimi_concox' ||
+          body.vendorFamily === 'teltonika_fmc' ||
+          body.vendorFamily === 'hikvision_dahua'
+            ? body.vendorFamily
+            : 'howen_streamax',
+        vendorName: String(body.vendorName),
+        modelSeries: String(body.modelSeries),
+        driverCode: String(body.driverCode),
+        driverVersion: String(body.driverVersion || '1.0.0-CUSTOM'),
+        protocol: body.protocol === 'Traccar' ? 'Traccar' : 'JT808/JT1078',
+        defaultPort: Number(body.defaultPort || 6808),
+        maxChannels: Number(body.maxChannels || 4),
+        defaultBitrateKbps: Number(body.defaultBitrateKbps || 2048),
+        supportedFeatures: {
+          adas: Boolean(body.supportedFeatures?.adas),
+          dms: Boolean(body.supportedFeatures?.dms),
+          bsd: Boolean(body.supportedFeatures?.bsd),
+          canJ1939: Boolean(body.supportedFeatures?.canJ1939),
+          rs232: Boolean(body.supportedFeatures?.rs232),
+          intercomAudio: Boolean(body.supportedFeatures?.intercomAudio),
+          dualSdSsd: Boolean(body.supportedFeatures?.dualSdSsd),
+          gSensor: Boolean(body.supportedFeatures?.gSensor ?? true),
+        },
+        notes: String(body.notes || ''),
+      },
+      ctx.user.name,
+      ctx.role.name,
+      Boolean(ctx.user.isHiddenSuperadmin)
+    );
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.status(201).json({
+      driver,
+      dashcamDrivers: data?.dashcamDrivers ?? [],
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
+  app.put('/api/devices/dashcam-config/batch', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!ctx.user.isHiddenSuperadmin && !hasWritePermission(ctx.role, 'dashcams_config')) {
+      res.status(403).json({
+        error:
+          'Acceso restringido: solo Superadmin, Admin de Empresa o perfiles autorizados pueden configurar drivers y prestaciones de dashcams en lote.',
+      });
+      return;
+    }
+    const body = req.body ?? {};
+    if (!Array.isArray(body.deviceIds) || body.deviceIds.length === 0 || !body.driverId) {
+      res.status(400).json({ error: 'Selecciona al menos una unidad y un driver de dashcam válido.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const updated = fleetStore.batchUpdateDeviceDashcamConfig(
+      ctx.tenant.id,
+      body.deviceIds.map(String),
+      {
+        driverId: String(body.driverId),
+        tcpPort: Number(body.tcpPort || 6808),
+        activeChannels: Array.isArray(body.activeChannels) ? body.activeChannels.map(String) : ['CH1 Frontal'],
+        resolution:
+          body.resolution === '720p_30fps' || body.resolution === '720p_15fps' ? body.resolution : '1080p_30fps',
+        bitrateKbps: Number(body.bitrateKbps || 2048),
+        gpsIntervalSec: Number(body.gpsIntervalSec || 15),
+        preEventSec: Number(body.preEventSec || 10),
+        postEventSec: Number(body.postEventSec || 15),
+        gSensorThresholdG: Number(body.gSensorThresholdG || 0.65),
+        features: {
+          adasEnabled: Boolean(body.features?.adasEnabled),
+          dmsEnabled: Boolean(body.features?.dmsEnabled),
+          bsdEnabled: Boolean(body.features?.bsdEnabled),
+          intercomEnabled: Boolean(body.features?.intercomEnabled),
+          loopRecordingSd: Boolean(body.features?.loopRecordingSd ?? true),
+          canBusEnabled: Boolean(body.features?.canBusEnabled),
+          rs232Peripheral:
+            body.features?.rs232Peripheral === 'rfid_operador' ||
+            body.features?.rs232Peripheral === 'sensor_combustible' ||
+            body.features?.rs232Peripheral === 'dualcam_uart'
+              ? body.features.rs232Peripheral
+              : 'ninguno',
+        },
+      },
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!updated) {
+      res.status(404).json({ error: 'Ninguno de los dispositivos o driver pertenecen a tu empresa.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.json({
+      updatedCount: updated.length,
+      updatedDevices: updated,
+      devices: data?.devices ?? [],
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
+  app.put('/api/devices/:id/dashcam-config', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!ctx.user.isHiddenSuperadmin && !hasWritePermission(ctx.role, 'dashcams_config')) {
+      res.status(403).json({ error: 'Acceso restringido: solo Superadmin, Admin de Empresa o perfiles autorizados pueden configurar drivers y prestaciones de dashcams.' });
+      return;
+    }
+    const body = req.body ?? {};
+    if (!body.driverId) {
+      res.status(400).json({ error: 'Selecciona un driver de dashcam válido.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const device = fleetStore.updateDeviceDashcamConfig(
+      ctx.tenant.id,
+      req.params.id,
+      {
+        driverId: String(body.driverId),
+        tcpPort: Number(body.tcpPort || 6808),
+        activeChannels: Array.isArray(body.activeChannels) ? body.activeChannels.map(String) : ['CH1 Frontal'],
+        resolution:
+          body.resolution === '720p_30fps' || body.resolution === '720p_15fps' ? body.resolution : '1080p_30fps',
+        bitrateKbps: Number(body.bitrateKbps || 2048),
+        gpsIntervalSec: Number(body.gpsIntervalSec || 15),
+        preEventSec: Number(body.preEventSec || 10),
+        postEventSec: Number(body.postEventSec || 15),
+        gSensorThresholdG: Number(body.gSensorThresholdG || 0.65),
+        features: {
+          adasEnabled: Boolean(body.features?.adasEnabled),
+          dmsEnabled: Boolean(body.features?.dmsEnabled),
+          bsdEnabled: Boolean(body.features?.bsdEnabled),
+          intercomEnabled: Boolean(body.features?.intercomEnabled),
+          loopRecordingSd: Boolean(body.features?.loopRecordingSd ?? true),
+          canBusEnabled: Boolean(body.features?.canBusEnabled),
+          rs232Peripheral:
+            body.features?.rs232Peripheral === 'rfid_operador' ||
+            body.features?.rs232Peripheral === 'sensor_combustible' ||
+            body.features?.rs232Peripheral === 'dualcam_uart'
+              ? body.features.rs232Peripheral
+              : 'ninguno',
+        },
+      },
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!device) {
+      res.status(404).json({ error: 'Dispositivo o driver no encontrado en tu empresa.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.json({
+      device,
+      devices: data?.devices ?? [],
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
+  app.post('/api/alerts/:id/acknowledge', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'alertas')) {
+      res.status(403).json({ error: 'Tu perfil no puede confirmar alertas.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const alert = fleetStore.acknowledgeAlert(
+      ctx.tenant.id,
+      req.params.id,
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!alert) {
+      res.status(404).json({ error: 'Alerta no encontrada.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.json({
+      alert,
+      vehicles: data?.vehicles ?? [],
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
+  app.post('/api/alerts/:id/escalate', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'incidentes')) {
+      res.status(403).json({ error: 'Tu perfil no puede escalar incidentes.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const result = fleetStore.escalateAlert(
+      ctx.tenant.id,
+      req.params.id,
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!result) {
+      res.status(404).json({ error: 'Alerta no encontrada.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.json({
+      ...result,
+      incidents: data?.incidents ?? [],
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
+  app.patch('/api/incidents/:id', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'incidentes')) {
+      res.status(403).json({ error: 'Tu perfil es de solo lectura en incidentes.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const incident = fleetStore.updateIncident(
+      ctx.tenant.id,
+      req.params.id,
+      req.body ?? {},
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!incident) {
+      res.status(404).json({ error: 'Incidente no encontrado.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.json({
+      incident,
+      vehicles: data?.vehicles ?? [],
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
+  app.post('/api/alert-rules', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'alertas')) {
+      res.status(403).json({ error: 'Tu perfil no puede crear reglas.' });
+      return;
+    }
+    const body = req.body ?? {};
+    if (!body.name || !body.thresholdLabel) {
+      res.status(400).json({ error: 'Nombre de regla y umbral son obligatorios.' });
+      return;
+    }
+    const rule = fleetStore.createRule(
+      resolveTargetTenantId(req, ctx),
+      {
+        name: String(body.name),
+        conditionType: body.conditionType || 'velocidad',
+        thresholdLabel: String(body.thresholdLabel),
+        priority: body.priority || 'alta',
+        autoCreateClip: Boolean(body.autoCreateClip ?? true),
+        active: true,
+        notifyQueue: String(body.notifyQueue || 'rabbitmq.alerts.high'),
+      },
+      ctx.user.name,
+      ctx.role.name,
+      Boolean(ctx.user.isHiddenSuperadmin)
+    );
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.status(201).json({ rule, auditLogs: data?.auditLogs ?? [] });
+  });
+
+  app.patch('/api/alert-rules/:id/toggle', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'alertas')) {
+      res.status(403).json({ error: 'Tu perfil no puede modificar reglas.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const rule = fleetStore.toggleRule(
+      ctx.tenant.id,
+      req.params.id,
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!rule) {
+      res.status(404).json({ error: 'Regla no encontrada.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.json({ rule, auditLogs: data?.auditLogs ?? [] });
+  });
+
+  app.post('/api/video-clips/request-stream', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'video')) {
+      res.status(403).json({ error: 'Tu perfil no puede solicitar transmisiones bajo demanda.' });
+      return;
+    }
+    const { vehicleId, channel } = req.body ?? {};
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const clip = fleetStore.requestOnDemandClip(
+      ctx.tenant.id,
+      String(vehicleId || ''),
+      channel === 'ch1_frontal' || channel === 'ch2_cabina' ? channel : 'dual',
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!clip) {
+      res.status(404).json({ error: 'Unidad no encontrada en tu empresa para transmisión JT1078.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.status(201).json({ clip, auditLogs: data?.auditLogs ?? [] });
+  });
+
+  app.patch('/api/video-clips/:id/retention', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'video')) {
+      res.status(403).json({ error: 'Tu perfil no puede cambiar la retención legal.' });
+      return;
+    }
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const clip = fleetStore.toggleClipRetention(
+      ctx.tenant.id,
+      req.params.id,
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!clip) {
+      res.status(404).json({ error: 'Clip no encontrado.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.json({ clip, auditLogs: data?.auditLogs ?? [] });
+  });
+
+  app.put('/api/sizing', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!hasWritePermission(ctx.role, 'dimensionamiento')) {
+      res.status(403).json({ error: 'Tu perfil no tiene permisos de dimensionamiento.' });
+      return;
+    }
+    const sizing = fleetStore.updateSizing(
+      resolveTargetTenantId(req, ctx),
+      req.body ?? {},
+      ctx.user.name,
+      ctx.role.name,
+      Boolean(ctx.user.isHiddenSuperadmin)
+    );
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.json({ sizing, auditLogs: data?.auditLogs ?? [] });
+  });
+
+  app.get('/api/reports/export', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    const scope = getRequestedScope(req, ctx);
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, scope);
+    const vehicles = data?.vehicles ?? [];
+    const header =
+      'Unidad,Tipo_Activo,Placa,Empresa,Sucursal,Conductor,Estado,Velocidad_kmh,Horometro_h,Proximo_Servicio_h,Proximo_Servicio_Fecha,Estado_Mantto,Fallas_DTC,Lat,Lng,Odometro_km\n';
+    const rows = vehicles
+      .map((v) => {
+        const tName = fleetStore.getTenantById(v.tenantId)?.name ?? ctx.tenant.name;
+        return [
+          v.unitCode,
+          v.assetType,
+          v.plate,
+          `"${tName}"`,
+          `"${v.branch}"`,
+          `"${v.driverName}"`,
+          v.operationalStatus,
+          v.speedKmh,
+          v.engineHours,
+          v.nextServiceHours,
+          v.nextServiceDate,
+          v.maintenanceStatus,
+          v.faultCodes.length,
+          v.lat,
+          v.lng,
+          v.odometerKm,
+        ].join(',');
+      })
+      .join('\n');
+
+    const exportScopeName = scope ?? ctx.tenant.id;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${exportScopeName}_flota_mantenimiento.csv"`);
+    res.send(header + rows);
+  });
+
+  const isProd = process.env.NODE_ENV === 'production';
+  if (isProd) {
+    const distPath = path.resolve(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  } else {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Vigilant FleetOps listening on http://localhost:${PORT}`);
+  });
+}
+
+startServer();

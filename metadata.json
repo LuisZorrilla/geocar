@@ -1,0 +1,6 @@
+{
+  "name": "Vigilant FleetOps",
+  "description": "Panel BackOffice operativo multiempresa para gestión de flotas, telemetría JT808/JT1078, monitoreo en mapa, alertas, incidentes y consola de video dashcam.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
