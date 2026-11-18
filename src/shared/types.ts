@@ -66,12 +66,16 @@ export interface UserAccount {
   tenantId: string;
   name: string;
   username: string;
-  password: string;
+  /** scrypt hash (see server/auth/password.ts). Never sent to the client. */
+  passwordHash: string;
   roleId: string;
   isCompanyAdmin: boolean;
   isHiddenSuperadmin?: boolean;
   status: 'activo' | 'inactivo';
   createdAt: string;
+  failedAttempts?: number;
+  /** ISO timestamp until which login is blocked after repeated failures. */
+  lockedUntil?: string | null;
 }
 
 export interface PublicUser {

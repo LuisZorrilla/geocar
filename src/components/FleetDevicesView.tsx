@@ -31,8 +31,7 @@ import type {
 } from '../shared/types.ts';
 import {
   ASSET_TYPE_LABELS,
-  getAuthToken,
-  getTenantScope,
+  downloadWithAuth,
   MAINTENANCE_META,
   STATUS_META,
 } from '../lib/api.ts';
@@ -319,10 +318,9 @@ export function FleetDevicesView({
   };
 
   const handleExportAll = () => {
-    const token = getAuthToken() ?? '';
-    const scope = getTenantScope();
-    const scopeParam = scope ? `&scopeTenantId=${encodeURIComponent(scope)}` : '';
-    window.location.href = `/api/reports/export?token=${encodeURIComponent(token)}${scopeParam}`;
+    downloadWithAuth('/api/reports/export', 'flota_mantenimiento.csv').catch((err) =>
+      window.alert(err instanceof Error ? err.message : 'No se pudo descargar el reporte.')
+    );
   };
 
   return (

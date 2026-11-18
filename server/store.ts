@@ -1,6 +1,7 @@
-import fs from 'fs';
-import path from 'path';
 import crypto from 'crypto';
+import { hashPassword, hashPasswordSync, hashToken, validatePasswordPolicy, verifyPassword } from './auth/password.ts';
+import { runMigrations } from './db/migrate.ts';
+import { StateRepository } from './db/stateRepository.ts';
 import type {
   AlertEvent,
   AlertRule,
@@ -39,7 +40,6 @@ import type {
   WorkOrderStatus,
 } from '../src/shared/types.ts';
 
-const DATA_FILE = path.resolve(process.cwd(), '.fleetops_data.json');
 const SCHEMA_VERSION = 8;
 
 const PRIORITY_RANK: Record<WorkOrderPriority, number> = {
@@ -430,7 +430,15 @@ function buildTenantBaseRoles(tenantId: string): RoleDefinition[] {
   ];
 }
 
-function buildInitialState(): FleetStoreState {
+type SeedUser = Omit<UserAccount, 'passwordHash'> & { password: string };
+
+export interface DemoCredential {
+  username: string;
+  password: string;
+  tenantId: string;
+}
+
+function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreState {
   const now = Date.now();
   const iso = (minutesAgo: number) => new Date(now - minutesAgo * 60_000).toISOString();
 
@@ -472,7 +480,7 @@ function buildInitialState(): FleetStoreState {
 
   const roles: RoleDefinition[] = tenants.flatMap((t) => buildTenantBaseRoles(t.id));
 
-  const users: UserAccount[] = [
+  const seedUsers: SeedUser[] = [
     // Hidden superadmin account: NEVER exposed in any user list or selector
     {
       id: 'usr-super-internal',
@@ -567,6 +575,13 @@ function buildInitialState(): FleetStoreState {
       createdAt: iso(2900),
     },
   ];
+  demoCredentials.push(...seedUsers.map((u) => ({ username: u.username, password: u.password, tenantId: u.tenantId })));
+  const users: UserAccount[] = seedUsers.map(({ password, ...u }) => ({
+    ...u,
+    passwordHash: hashPasswordSync(password),
+    failedAttempts: 0,
+    lockedUntil: null,
+  }));
 
   const tenantCounts = [
     { tenantId: 'ten-norte', count: 42, prefix: 'TLN', corridorIndices: [0, 1], groupPrefix: 'Tractocamión / Obra' },
@@ -1592,49 +1607,124 @@ function buildInitialState(): FleetStoreState {
 }
 
 export interface ActiveSession {
-  token: string;
+  /** sha256 of the bearer token; the raw token is never stored. */
+  tokenHash: string;
   userId: string;
   tenantId: string;
   createdAt: number;
+  lastSeenAt: number;
+  expiresAt: number;
+}
+
+export interface SessionMeta {
+  ip?: string;
+  userAgent?: string;
+}
+
+const SESSION_IDLE_MS = Number(process.env.SESSION_IDLE_HOURS || 12) * 3_600_000;
+const SESSION_MAX_MS = Number(process.env.SESSION_MAX_DAYS || 7) * 86_400_000;
+const SESSION_TOUCH_PERSIST_MS = 5 * 60_000;
+const MAX_FAILED_LOGINS = 5;
+const LOCKOUT_MS = 15 * 60_000;
+// Keeps login timing similar whether or not the username exists.
+const DUMMY_PASSWORD_HASH = hashPasswordSync(crypto.randomBytes(12).toString('hex'));
+
+/** Random id fragment. Replaces timestamp-based ids, which could collide and overwrite rows on upsert. */
+function uid(): string {
+  return crypto.randomUUID().replace(/-/g, '').slice(0, 10);
 }
 
 class FleetStore {
-  private state: FleetStoreState;
+  private state!: FleetStoreState;
   private sessions: Map<string, ActiveSession> = new Map();
+  private sessionTouchPersistedAt: Map<string, number> = new Map();
+  private repo = new StateRepository();
+  private pendingWrite: Promise<void> = Promise.resolve();
+  private initialized = false;
 
-  constructor() {
-    this.state = this.loadOrSeed();
-  }
-
-  private loadOrSeed(): FleetStoreState {
-    try {
-      if (fs.existsSync(DATA_FILE)) {
-        const raw = fs.readFileSync(DATA_FILE, 'utf-8');
-        const parsed = JSON.parse(raw) as FleetStoreState;
-        if (
-          parsed &&
-          parsed.schemaVersion === SCHEMA_VERSION &&
-          Array.isArray(parsed.vehicles) &&
-          Array.isArray(parsed.users) &&
-          parsed.vehicles.length > 0
-        ) {
-          return parsed;
-        }
-      }
-    } catch {
-      // Fall back to fresh seed
+  async init(): Promise<void> {
+    if (this.initialized) return;
+    await runMigrations();
+    const loaded = await this.repo.loadState(SCHEMA_VERSION);
+    if (loaded) {
+      this.state = loaded;
+    } else {
+      this.state = this.buildFreshState();
+      this.persist(this.state);
+      await this.flush();
     }
-    const seeded = buildInitialState();
-    this.persist(seeded);
-    return seeded;
+    for (const s of await this.repo.loadActiveSessions()) {
+      this.sessions.set(s.tokenHash, s);
+    }
+    this.initialized = true;
   }
 
+  private buildFreshState(): FleetStoreState {
+    const demoCredentials: DemoCredential[] = [];
+    const seeded = buildInitialState(demoCredentials);
+    if (process.env.SEED_DEMO_DATA === 'true') {
+      console.log('\n[seed] Base de datos vacía: se sembraron los datos DEMO. Credenciales (solo desarrollo):');
+      for (const c of demoCredentials) console.log(`  - ${c.username.padEnd(18)} ${c.password}   (${c.tenantId})`);
+      console.log('');
+      return seeded;
+    }
+
+    const username = process.env.SUPERADMIN_USERNAME?.trim();
+    const password = process.env.SUPERADMIN_PASSWORD;
+    const policyError = validatePasswordPolicy(password);
+    if (!username || policyError) {
+      throw new Error(
+        'Base de datos vacía. Define SEED_DEMO_DATA=true (desarrollo) o SUPERADMIN_USERNAME y SUPERADMIN_PASSWORD ' +
+          `(producción) en .env. ${policyError ?? ''}`
+      );
+    }
+    console.log(`[seed] Base de datos vacía: se creó únicamente el superadmin "${username}".`);
+    return {
+      ...seeded,
+      tenants: [],
+      roles: [],
+      users: [
+        {
+          id: 'usr-super-internal',
+          tenantId: 'global',
+          name: 'Super Admin Global',
+          username: username.toLowerCase(),
+          passwordHash: hashPasswordSync(password!),
+          roleId: SUPERADMIN_ROLE.id,
+          isCompanyAdmin: true,
+          isHiddenSuperadmin: true,
+          status: 'activo',
+          createdAt: new Date().toISOString(),
+          failedAttempts: 0,
+          lockedUntil: null,
+        },
+      ],
+      drivers: [],
+      vehicles: [],
+      devices: [],
+      maintenanceRecords: [],
+      workOrders: [],
+      preventivePlans: [],
+      partsInventory: [],
+      checklists: [],
+      alertRules: [],
+      alerts: [],
+      incidents: [],
+      videoClips: [],
+      auditLogs: [],
+    };
+  }
+
+  /** Queue a diff-based write of the whole state to PostgreSQL. */
   private persist(nextState: FleetStoreState): void {
-    try {
-      fs.writeFileSync(DATA_FILE, JSON.stringify(nextState, null, 2), 'utf-8');
-    } catch {
-      // Non-fatal in read-only environments
-    }
+    const write = this.repo.saveState(nextState);
+    write.catch((err) => console.error('[db] Error al guardar el estado:', err));
+    this.pendingWrite = write;
+  }
+
+  /** Resolves once every queued write is committed; rejects if the latest write failed. */
+  async flush(): Promise<void> {
+    await this.pendingWrite;
   }
 
   private buildGlobalTenantSummary(): Tenant {
@@ -1673,30 +1763,51 @@ class FleetStore {
     return this.state.tenants.find((t) => t.id === tenantId);
   }
 
-  getDemoLoginAccounts(): Array<{ tenantId: string; tenantName: string; username: string; password: string; roleLabel: string }> {
-    return this.state.tenants.map((t) => {
-      const admin = this.state.users.find(
-        (u) => u.tenantId === t.id && u.isCompanyAdmin && !u.isHiddenSuperadmin && u.roleId !== 'super_admin_internal'
-      );
-      return {
-        tenantId: t.id,
-        tenantName: t.name,
-        username: admin?.username ?? '',
-        password: admin?.password ?? '',
-        roleLabel: 'Admin de Empresa',
-      };
-    });
-  }
-
-  authenticate(username: string, password: string): { token: string; tenant: Tenant; user: PublicUser; role: RoleDefinition } | null {
+  async authenticate(
+    username: string,
+    password: string,
+    meta: SessionMeta = {}
+  ): Promise<
+    | { ok: true; token: string; tenant: Tenant; user: PublicUser; role: RoleDefinition }
+    | { ok: false; error: string; status: number }
+  > {
+    const invalid = { ok: false as const, error: 'Credenciales inválidas o cuenta inactiva.', status: 401 };
     const normalized = username.trim().toLowerCase();
-    const account = this.state.users.find(
-      (u) =>
-        u.username.toLowerCase() === normalized &&
-        u.password === password &&
-        u.status === 'activo'
-    );
-    if (!account) return null;
+    const account = this.state.users.find((u) => u.username.toLowerCase() === normalized);
+
+    if (!account) {
+      await verifyPassword(password, DUMMY_PASSWORD_HASH);
+      return invalid;
+    }
+    if (account.lockedUntil && Date.parse(account.lockedUntil) > Date.now()) {
+      return {
+        ok: false,
+        status: 423,
+        error: 'Cuenta bloqueada temporalmente por intentos fallidos. Intenta de nuevo en 15 minutos.',
+      };
+    }
+
+    const valid = await verifyPassword(password, account.passwordHash);
+    if (!valid) {
+      account.failedAttempts = (account.failedAttempts ?? 0) + 1;
+      if (account.failedAttempts >= MAX_FAILED_LOGINS) {
+        account.lockedUntil = new Date(Date.now() + LOCKOUT_MS).toISOString();
+        account.failedAttempts = 0;
+        this.addAuditLog({
+          tenantId: account.tenantId,
+          actorName: 'Sistema',
+          actorRole: 'Seguridad',
+          actorHidden: Boolean(account.isHiddenSuperadmin),
+          module: 'Seguridad y Usuarios',
+          action: 'Bloqueo por intentos fallidos',
+          targetLabel: account.username,
+          detail: `Cuenta bloqueada ${LOCKOUT_MS / 60_000} minutos tras ${MAX_FAILED_LOGINS} intentos fallidos.`,
+        });
+      }
+      this.persist(this.state);
+      return invalid;
+    }
+    if (account.status !== 'activo') return invalid;
 
     const isSuperadmin = Boolean(account.isHiddenSuperadmin);
     const tenant = isSuperadmin
@@ -1705,28 +1816,48 @@ class FleetStore {
     const role = isSuperadmin
       ? SUPERADMIN_ROLE
       : this.state.roles.find((r) => r.id === account.roleId && r.tenantId === account.tenantId);
-    if (!tenant || !role) return null;
+    if (!tenant || !role) return invalid;
 
-    const token = crypto.randomBytes(24).toString('hex');
-    this.sessions.set(token, {
-      token,
+    if (account.failedAttempts || account.lockedUntil) {
+      account.failedAttempts = 0;
+      account.lockedUntil = null;
+      this.persist(this.state);
+    }
+
+    const token = crypto.randomBytes(32).toString('hex');
+    const now = Date.now();
+    const session: ActiveSession = {
+      tokenHash: hashToken(token),
       userId: account.id,
       tenantId: isSuperadmin ? 'all' : account.tenantId,
-      createdAt: Date.now(),
-    });
-
-    return {
-      token,
-      tenant,
-      user: this.toPublicUser(account),
-      role,
+      createdAt: now,
+      lastSeenAt: now,
+      expiresAt: now + SESSION_MAX_MS,
     };
+    await this.repo.saveSession(session, meta);
+    this.sessions.set(session.tokenHash, session);
+    this.sessionTouchPersistedAt.set(session.tokenHash, now);
+
+    return { ok: true, token, tenant, user: this.toPublicUser(account), role };
   }
 
   resolveSession(token: string | undefined): { session: ActiveSession; user: UserAccount; role: RoleDefinition; tenant: Tenant } | null {
     if (!token) return null;
-    const session = this.sessions.get(token);
+    const tokenHash = hashToken(token);
+    const session = this.sessions.get(tokenHash);
     if (!session) return null;
+
+    const now = Date.now();
+    if (now >= session.expiresAt || now - session.lastSeenAt > SESSION_IDLE_MS) {
+      void this.revokeSessionByHash(tokenHash);
+      return null;
+    }
+    session.lastSeenAt = now;
+    if (now - (this.sessionTouchPersistedAt.get(tokenHash) ?? 0) > SESSION_TOUCH_PERSIST_MS) {
+      this.sessionTouchPersistedAt.set(tokenHash, now);
+      this.repo.touchSession(tokenHash, now).catch((err) => console.error('[db] touchSession:', err));
+    }
+
     const user = this.state.users.find((u) => u.id === session.userId && u.status === 'activo');
     if (!user) return null;
 
@@ -1745,8 +1876,51 @@ class FleetStore {
     return { session, user, role, tenant };
   }
 
-  revokeSession(token: string): void {
-    this.sessions.delete(token);
+  async revokeSession(token: string): Promise<void> {
+    await this.revokeSessionByHash(hashToken(token));
+  }
+
+  private async revokeSessionByHash(tokenHash: string): Promise<void> {
+    this.sessions.delete(tokenHash);
+    this.sessionTouchPersistedAt.delete(tokenHash);
+    await this.repo.deleteSession(tokenHash).catch((err) => console.error('[db] deleteSession:', err));
+  }
+
+  /** Revoke every session of a user (password change, deactivation), optionally keeping one. */
+  private async revokeUserSessions(userId: string, keepTokenHash?: string): Promise<void> {
+    for (const [hash, s] of [...this.sessions]) {
+      if (s.userId === userId && hash !== keepTokenHash) await this.revokeSessionByHash(hash);
+    }
+  }
+
+  async changeOwnPassword(
+    userId: string,
+    currentTokenHash: string,
+    currentPassword: string,
+    newPassword: string
+  ): Promise<{ ok: true } | { ok: false; error: string; status: number }> {
+    const user = this.state.users.find((u) => u.id === userId && u.status === 'activo');
+    if (!user) return { ok: false, error: 'Usuario no disponible.', status: 404 };
+    if (!(await verifyPassword(currentPassword, user.passwordHash))) {
+      return { ok: false, error: 'La contraseña actual no es correcta.', status: 400 };
+    }
+    const policyError = validatePasswordPolicy(newPassword);
+    if (policyError) return { ok: false, error: policyError, status: 400 };
+
+    user.passwordHash = await hashPassword(newPassword);
+    this.addAuditLog({
+      tenantId: user.tenantId,
+      actorName: user.name,
+      actorRole: this.toPublicUser(user).roleName,
+      actorHidden: Boolean(user.isHiddenSuperadmin),
+      module: 'Seguridad y Usuarios',
+      action: 'Cambio de contraseña',
+      targetLabel: user.username,
+      detail: 'El usuario cambió su contraseña. Se cerraron sus otras sesiones.',
+    });
+    this.persist(this.state);
+    await this.revokeUserSessions(user.id, currentTokenHash);
+    return { ok: true };
   }
 
   getTenantBootstrap(tenantId: string, currentUserId: string, scopeTenantId?: string): TenantBootstrapResponse | null {
@@ -2017,7 +2191,7 @@ class FleetStore {
   addAuditLog(entry: Omit<AuditLog, 'id' | 'timestamp'>): AuditLog {
     const log: AuditLog = {
       ...entry,
-      id: `aud-${Date.now().toString().slice(-6)}`,
+      id: `aud-${uid()}`,
       timestamp: new Date().toISOString(),
     };
     this.state.auditLogs.unshift(log);
@@ -2043,7 +2217,7 @@ class FleetStore {
       dashcams_config: input.permissions.dashcams_config ?? 'none',
     };
     const role: RoleDefinition = {
-      id: `rol-${resolvedTenantId}-${Date.now().toString().slice(-5)}`,
+      id: `rol-${resolvedTenantId}-${uid()}`,
       tenantId: resolvedTenantId,
       name: input.name.trim(),
       description: input.description.trim() || 'Perfil operativo personalizado de empresa.',
@@ -2101,17 +2275,21 @@ class FleetStore {
     return role;
   }
 
-  createUser(
+  async createUser(
     tenantId: string,
     input: { name: string; username: string; password: string; roleId: string },
     actorName: string,
     actorRole: string,
     allowAllTenants = false,
     actorHidden = false
-  ): { user?: PublicUser; error?: string } {
+  ): Promise<{ user?: PublicUser; error?: string }> {
     const usernameLower = input.username.trim().toLowerCase().replace(/\s+/g, '.');
     if (!usernameLower) {
       return { error: 'El nombre de usuario es obligatorio.' };
+    }
+    const policyError = validatePasswordPolicy(input.password);
+    if (policyError) {
+      return { error: policyError };
     }
     if (this.state.users.some((u) => u.username.toLowerCase() === usernameLower)) {
       return { error: 'Ya existe un usuario registrado con ese nombre de usuario.' };
@@ -2127,17 +2305,23 @@ class FleetStore {
     }
 
     const user: UserAccount = {
-      id: `usr-${Date.now().toString().slice(-6)}`,
+      id: `usr-${uid()}`,
       tenantId: role.tenantId,
       name: input.name.trim(),
       username: usernameLower,
-      password: input.password || 'Clave2026!',
+      passwordHash: await hashPassword(input.password),
       roleId: role.id,
       isCompanyAdmin: Boolean(role.isSystemAdminRole),
       isHiddenSuperadmin: false,
       status: 'activo',
       createdAt: new Date().toISOString(),
+      failedAttempts: 0,
+      lockedUntil: null,
     };
+    // Re-check after the async hash: another request may have taken the username meanwhile.
+    if (this.state.users.some((u) => u.username.toLowerCase() === usernameLower)) {
+      return { error: 'Ya existe un usuario registrado con ese nombre de usuario.' };
+    }
     this.state.users.push(user);
     this.addAuditLog({
       tenantId: role.tenantId,
@@ -2153,19 +2337,29 @@ class FleetStore {
     return { user: this.toPublicUser(user) };
   }
 
-  updateUser(
+  async updateUser(
     tenantId: string,
     userId: string,
-    patch: { roleId?: string; status?: 'activo' | 'inactivo' },
+    patch: { roleId?: string; status?: 'activo' | 'inactivo'; password?: string },
     actorName: string,
     actorRole: string,
     allowAllTenants = false,
     actorHidden = false
-  ): PublicUser | null {
+  ): Promise<PublicUser | { error: string } | null> {
     const user = this.state.users.find(
       (u) => u.id === userId && (allowAllTenants || u.tenantId === tenantId) && !u.isHiddenSuperadmin
     );
     if (!user) return null;
+
+    let passwordReset = false;
+    if (patch.password !== undefined && patch.password !== '') {
+      const policyError = validatePasswordPolicy(patch.password);
+      if (policyError) return { error: policyError };
+      user.passwordHash = await hashPassword(patch.password);
+      user.failedAttempts = 0;
+      user.lockedUntil = null;
+      passwordReset = true;
+    }
 
     if (patch.roleId) {
       const role = this.state.roles.find(
@@ -2188,9 +2382,14 @@ class FleetStore {
       module: 'Seguridad y Usuarios',
       action: 'Actualización de usuario',
       targetLabel: user.username,
-      detail: `Estado: ${user.status} · Perfil: ${this.toPublicUser(user).roleName}.`,
+      detail:
+        `Estado: ${user.status} · Perfil: ${this.toPublicUser(user).roleName}.` +
+        (passwordReset ? ' Contraseña restablecida por administrador.' : ''),
     });
     this.persist(this.state);
+    if (passwordReset || user.status !== 'activo') {
+      await this.revokeUserSessions(user.id);
+    }
     return this.toPublicUser(user);
   }
 
@@ -2217,9 +2416,9 @@ class FleetStore {
     const tenant = this.state.tenants.find((t) => t.id === tenantId) ?? this.state.tenants[0];
     const corridor = CORRIDORS.find((c) => c.branch === input.branch) ?? CORRIDORS[0];
     const num = this.state.vehicles.length + 1;
-    const driverId = `drv-${Date.now().toString().slice(-5)}`;
-    const vehicleId = `veh-${Date.now().toString().slice(-5)}`;
-    const deviceId = `dev-${Date.now().toString().slice(-5)}`;
+    const driverId = `drv-${uid()}`;
+    const vehicleId = `veh-${uid()}`;
+    const deviceId = `dev-${uid()}`;
     const nowIso = new Date().toISOString();
 
     const engineHours = Number(input.engineHours ?? 120);
@@ -2353,7 +2552,7 @@ class FleetStore {
       : computeServiceDateFromHours(vehicle.engineHours, targetHours, 'al_dia');
 
     const record: MaintenanceRecord = {
-      id: `mnt-${Date.now().toString().slice(-5)}`,
+      id: `mnt-${uid()}`,
       tenantId: vehicle.tenantId,
       vehicleId: vehicle.id,
       unitCode: vehicle.unitCode,
@@ -2469,7 +2668,7 @@ class FleetStore {
       const qty = Math.max(1, Number(p.quantity || 1));
       const unitCost = Math.max(0, Number(p.unitCostMxn || 0));
       return {
-        id: `prt-${Date.now().toString().slice(-5)}-${idx}`,
+        id: `prt-${uid()}-${idx}`,
         sku: (p.sku || `REF-${100 + idx}`).trim().toUpperCase(),
         name: p.name.trim(),
         category: p.category === 'insumo' || p.category === 'mano_obra' ? p.category : 'refaccion',
@@ -2482,7 +2681,7 @@ class FleetStore {
     const laborCostMxn = Math.max(0, Number(input.laborCostMxn || 0));
     const totalCostMxn = Number((partsCostMxn + laborCostMxn).toFixed(2));
     const order: WorkOrder = {
-      id: `OT-${vehicle.unitCode.split('-')[0]}-${Date.now().toString().slice(-4)}`,
+      id: `OT-${vehicle.unitCode.split('-')[0]}-${uid()}`,
       tenantId: vehicle.tenantId,
       vehicleId: vehicle.id,
       unitCode: vehicle.unitCode,
@@ -2568,7 +2767,7 @@ class FleetStore {
         const qty = Math.max(1, Number(p.quantity || 1));
         const unitCost = Math.max(0, Number(p.unitCostMxn || 0));
         return {
-          id: `prt-${Date.now().toString().slice(-5)}-${idx}`,
+          id: `prt-${uid()}-${idx}`,
           sku: (p.sku || `REF-${100 + idx}`).trim().toUpperCase(),
           name: p.name.trim(),
           category: p.category === 'insumo' || p.category === 'mano_obra' ? p.category : 'refaccion',
@@ -2634,7 +2833,7 @@ class FleetStore {
         updatedVehicle = veh;
 
         createdRecord = {
-          id: `mnt-${Date.now().toString().slice(-5)}`,
+          id: `mnt-${uid()}`,
           tenantId: veh.tenantId,
           vehicleId: veh.id,
           unitCode: veh.unitCode,
@@ -2699,7 +2898,7 @@ class FleetStore {
       ? tenantId
       : this.state.tenants[0].id;
     const plan: PreventivePlan = {
-      id: `pln-${resolvedTenantId}-${Date.now().toString().slice(-5)}`,
+      id: `pln-${resolvedTenantId}-${uid()}`,
       tenantId: resolvedTenantId,
       name: input.name.trim(),
       assetType: input.assetType,
@@ -2806,7 +3005,7 @@ class FleetStore {
           : item.sku.includes('FLT') || item.sku.includes('OIL') || item.sku.includes('BAL'))
     );
     const selectedParts: WorkOrderPart[] = invCandidates.slice(0, 2).map((item, idx) => ({
-      id: `prt-auto-${Date.now().toString().slice(-4)}-${idx}`,
+      id: `prt-auto-${uid()}-${idx}`,
       sku: item.sku,
       name: item.name,
       category: item.category,
@@ -2818,7 +3017,7 @@ class FleetStore {
     const laborCostMxn = Math.max(1200, Math.round(plan.estimatedCostMxn * 0.45));
 
     const order: WorkOrder = {
-      id: `OT-AUTO-${vehicle.unitCode.split('-')[0]}-${Date.now().toString().slice(-4)}`,
+      id: `OT-AUTO-${vehicle.unitCode.split('-')[0]}-${uid()}`,
       tenantId: vehicle.tenantId,
       vehicleId: vehicle.id,
       unitCode: vehicle.unitCode,
@@ -3042,7 +3241,7 @@ class FleetStore {
     }
 
     const item: PartInventoryItem = {
-      id: `inv-${resolvedTenantId}-${Date.now().toString().slice(-5)}`,
+      id: `inv-${resolvedTenantId}-${uid()}`,
       tenantId: resolvedTenantId,
       sku: normalizedSku,
       name: input.name.trim(),
@@ -3151,7 +3350,7 @@ class FleetStore {
     }
 
     const checklist: PreOpChecklist = {
-      id: `CHK-${vehicle.unitCode.split('-')[0]}-${Date.now().toString().slice(-4)}`,
+      id: `CHK-${vehicle.unitCode.split('-')[0]}-${uid()}`,
       tenantId: vehicle.tenantId,
       vehicleId: vehicle.id,
       unitCode: vehicle.unitCode,
@@ -3205,7 +3404,7 @@ class FleetStore {
       ? tenantId
       : this.state.tenants[0].id;
     const driver: DashcamDriverProfile = {
-      id: `drv-custom-${Date.now().toString().slice(-5)}`,
+      id: `drv-custom-${uid()}`,
       vendorFamily: input.vendorFamily,
       vendorName: input.vendorName.trim(),
       modelSeries: input.modelSeries.trim(),
@@ -3455,7 +3654,7 @@ class FleetStore {
     }
 
     const incident: Incident = {
-      id: `inc-${Date.now().toString().slice(-4)}`,
+      id: `inc-${uid()}`,
       tenantId: alert.tenantId,
       alertId: alert.id,
       vehicleId: alert.vehicleId,
@@ -3565,7 +3764,7 @@ class FleetStore {
     const rule: AlertRule = {
       ...input,
       tenantId: resolvedTenantId,
-      id: `rul-${Date.now().toString().slice(-4)}`,
+      id: `rul-${uid()}`,
     };
     this.state.alertRules.unshift(rule);
     this.addAuditLog({
@@ -3595,7 +3794,7 @@ class FleetStore {
       (v) => v.id === vehicleId && (allowAllTenants || v.tenantId === tenantId)
     );
     if (!vehicle) return null;
-    const clipId = `clp-${Date.now().toString().slice(-4)}`;
+    const clipId = `clp-${uid()}`;
     const isUrban = vehicle.tenantId === 'ten-urbana';
     const clip: VideoClip = {
       id: clipId,

@@ -81,6 +81,36 @@ export async function apiRequest<T>(url: string, options: RequestInit = {}): Pro
   return data as T;
 }
 
+/**
+ * Downloads a protected file using the Authorization header, so the session
+ * token never appears in the URL (browser history, proxy and server logs).
+ */
+export async function downloadWithAuth(url: string, fallbackFilename: string): Promise<void> {
+  const headers = new Headers();
+  const token = getAuthToken();
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  const scope = getTenantScope();
+  if (scope) headers.set('x-tenant-scope', scope);
+
+  const res = await fetch(url, { headers });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(typeof data.error === 'string' ? data.error : `Error HTTP ${res.status}`);
+  }
+  const disposition = res.headers.get('Content-Disposition') ?? '';
+  const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(disposition);
+  const filename = match ? decodeURIComponent(match[1]) : fallbackFilename;
+
+  const blobUrl = URL.createObjectURL(await res.blob());
+  const link = document.createElement('a');
+  link.href = blobUrl;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+}
+
 export function formatRelativeTime(iso: string): string {
   const diffSec = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
   if (diffSec < 60) return `hace ${diffSec} s`;

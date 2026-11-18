@@ -1,9 +1,12 @@
+import 'dotenv/config';
 import express from 'express';
 import path from 'path';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import type { ModulePermissions, RoleDefinition, Tenant } from './src/shared/types.ts';
 import { fleetStore, type ActiveSession } from './server/store.ts';
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000);
 
 interface AuthContext {
   session: ActiveSession;
@@ -25,9 +28,7 @@ function extractToken(req: express.Request): string | undefined {
   if (typeof auth === 'string' && auth.startsWith('Bearer ')) {
     return auth.slice(7).trim();
   }
-  if (typeof req.query.token === 'string' && req.query.token.trim()) {
-    return req.query.token.trim();
-  }
+  // Tokens in the query string are intentionally not accepted: they leak into logs and browser history.
   return undefined;
 }
 
@@ -63,31 +64,103 @@ function resolveTargetTenantId(req: express.Request, ctx: AuthContext): string {
 }
 
 async function startServer() {
-  const app = express();
-  app.use(express.json());
+  await fleetStore.init();
 
-  // Public auth routes (never expose superadmin)
-  app.get('/api/auth/demo-accounts', (_req, res) => {
-    res.json({ accounts: fleetStore.getDemoLoginAccounts() });
+  const app = express();
+  const isProd = process.env.NODE_ENV === 'production';
+  if (process.env.TRUST_PROXY) app.set('trust proxy', process.env.TRUST_PROXY);
+  app.use(
+    helmet({
+      // The Vite dev server injects inline scripts; the map SDKs load remote tiles and workers.
+      contentSecurityPolicy: false,
+      crossOriginEmbedderPolicy: false,
+    })
+  );
+  app.use(express.json({ limit: '1mb' }));
+
+  // Every successful write response means the change is committed to PostgreSQL.
+  app.use('/api', (req, res, next) => {
+    if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+    const originalJson = res.json.bind(res);
+    const originalSend = res.send.bind(res);
+    let flushed = false;
+    const afterFlush = (send: () => void) => {
+      if (flushed) return send();
+      fleetStore.flush().then(
+        () => {
+          flushed = true;
+          send();
+        },
+        (err) => {
+          console.error(`[db] ${req.method} ${req.originalUrl}: no se pudo guardar`, err);
+          flushed = true;
+          res.status(500);
+          originalJson({ error: 'No se pudo guardar el cambio. Intenta de nuevo.' });
+        }
+      );
+      return res;
+    };
+    res.json = ((body: unknown) => afterFlush(() => originalJson(body))) as typeof res.json;
+    res.send = ((body: unknown) => afterFlush(() => originalSend(body))) as typeof res.send;
+    next();
   });
 
-  app.post('/api/auth/login', (req, res) => {
+  const authLimiter = rateLimit({
+    windowMs: 15 * 60_000,
+    limit: 30,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { error: 'Demasiados intentos. Espera unos minutos e intenta de nuevo.' },
+  });
+  app.use('/api/auth', authLimiter);
+
+  app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body ?? {};
     if (!username || !password) {
       res.status(400).json({ error: 'Ingresa usuario y contraseña de la empresa.' });
       return;
     }
-    const auth = fleetStore.authenticate(String(username), String(password));
-    if (!auth) {
-      res.status(401).json({ error: 'Credenciales inválidas o cuenta inactiva.' });
-      return;
+    try {
+      const result = await fleetStore.authenticate(String(username), String(password), {
+        ip: req.ip,
+        userAgent: req.get('user-agent') ?? undefined,
+      });
+      if (!result.ok) {
+        res.status(result.status).json({ error: result.error });
+        return;
+      }
+      const { ok: _ok, ...auth } = result;
+      res.json(auth);
+    } catch (err) {
+      console.error('[auth] login:', err);
+      res.status(500).json({ error: 'No fue posible iniciar sesión. Intenta de nuevo.' });
     }
-    res.json(auth);
   });
 
-  app.post('/api/auth/logout', (req, res) => {
+  app.post('/api/auth/logout', async (req, res) => {
     const token = extractToken(req);
-    if (token) fleetStore.revokeSession(token);
+    if (token) await fleetStore.revokeSession(token);
+    res.json({ ok: true });
+  });
+
+  app.post('/api/auth/change-password', async (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    const { currentPassword, newPassword } = req.body ?? {};
+    if (typeof currentPassword !== 'string' || typeof newPassword !== 'string') {
+      res.status(400).json({ error: 'Indica la contraseña actual y la nueva.' });
+      return;
+    }
+    const result = await fleetStore.changeOwnPassword(
+      ctx.user.id,
+      ctx.session.tokenHash,
+      currentPassword,
+      newPassword
+    );
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
     res.json({ ok: true });
   });
 
@@ -177,7 +250,7 @@ async function startServer() {
   });
 
   // Company Admin: Users (strictly excludes superadmin)
-  app.post('/api/users', (req, res) => {
+  app.post('/api/users', async (req, res) => {
     const ctx = requireAuth(req, res);
     if (!ctx) return;
     if (!ctx.user.isCompanyAdmin && ctx.role.permissions.administracion !== 'full') {
@@ -185,14 +258,14 @@ async function startServer() {
       return;
     }
     const { name, username, password, roleId } = req.body ?? {};
-    if (!name || !username || !roleId) {
-      res.status(400).json({ error: 'Nombre, usuario y perfil son obligatorios.' });
+    if (!name || !username || !roleId || !password) {
+      res.status(400).json({ error: 'Nombre, usuario, contraseña y perfil son obligatorios.' });
       return;
     }
     const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
-    const result = fleetStore.createUser(
+    const result = await fleetStore.createUser(
       resolveTargetTenantId(req, ctx),
-      { name: String(name), username: String(username), password: String(password || 'Clave2026!'), roleId: String(roleId) },
+      { name: String(name), username: String(username), password: String(password), roleId: String(roleId) },
       ctx.user.name,
       ctx.role.name,
       isSuper,
@@ -206,7 +279,7 @@ async function startServer() {
     res.status(201).json({ user: result.user, users: data?.users ?? [], auditLogs: data?.auditLogs ?? [] });
   });
 
-  app.patch('/api/users/:id', (req, res) => {
+  app.patch('/api/users/:id', async (req, res) => {
     const ctx = requireAuth(req, res);
     if (!ctx) return;
     if (!ctx.user.isCompanyAdmin && ctx.role.permissions.administracion !== 'full') {
@@ -214,10 +287,15 @@ async function startServer() {
       return;
     }
     const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
-    const updated = fleetStore.updateUser(
+    const { roleId, status, password } = req.body ?? {};
+    const updated = await fleetStore.updateUser(
       ctx.tenant.id,
       req.params.id,
-      req.body ?? {},
+      {
+        roleId: typeof roleId === 'string' ? roleId : undefined,
+        status: status === 'activo' || status === 'inactivo' ? status : undefined,
+        password: typeof password === 'string' ? password : undefined,
+      },
       ctx.user.name,
       ctx.role.name,
       isSuper,
@@ -225,6 +303,10 @@ async function startServer() {
     );
     if (!updated) {
       res.status(404).json({ error: 'Usuario no encontrado en esta empresa.' });
+      return;
+    }
+    if ('error' in updated) {
+      res.status(400).json({ error: updated.error });
       return;
     }
     const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
@@ -1182,7 +1264,6 @@ async function startServer() {
     res.send(header + rows);
   });
 
-  const isProd = process.env.NODE_ENV === 'production';
   if (isProd) {
     const distPath = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distPath));
@@ -1203,4 +1284,7 @@ async function startServer() {
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('[startup] No se pudo iniciar el servidor:', err instanceof Error ? err.message : err);
+  process.exit(1);
+});

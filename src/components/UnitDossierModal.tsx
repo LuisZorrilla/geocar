@@ -25,7 +25,7 @@ import {
   ASSET_TYPE_LABELS,
   formatRelativeTime,
   formatServiceDate,
-  getAuthToken,
+  downloadWithAuth,
   getServiceDateDeltaDays,
   MAINTENANCE_META,
   STATUS_META,
@@ -128,8 +128,9 @@ export function UnitDossierModal({
   if (!vehicleId) return null;
 
   const handleExport = (format: 'csv' | 'json') => {
-    const token = getAuthToken() ?? '';
-    window.location.href = `/api/vehicles/${vehicleId}/export?format=${format}&token=${encodeURIComponent(token)}`;
+    downloadWithAuth(`/api/vehicles/${vehicleId}/export?format=${format}`, `${vehicleId}.${format}`).catch((err) =>
+      window.alert(err instanceof Error ? err.message : 'No se pudo descargar el archivo.')
+    );
   };
 
   const handleToggleForm = () => {

@@ -12,7 +12,7 @@ import type {
   Vehicle,
   VideoClip,
 } from '../shared/types.ts';
-import { formatTimeClock, getAuthToken, getTenantScope, PERMISSION_LABELS } from '../lib/api.ts';
+import { downloadWithAuth, formatTimeClock, PERMISSION_LABELS } from '../lib/api.ts';
 import { Pagination, usePagination } from './Pagination.tsx';
 
 interface ReportsSecurityViewProps {
@@ -119,10 +119,9 @@ export function ReportsSecurityView({
   const maintAlertCount = vehicles.filter((v) => v.maintenanceStatus !== 'al_dia').length;
 
   const handleExportCsv = () => {
-    const token = getAuthToken() ?? '';
-    const scope = getTenantScope();
-    const scopeParam = scope ? `&scopeTenantId=${encodeURIComponent(scope)}` : '';
-    window.location.href = `/api/reports/export?token=${encodeURIComponent(token)}${scopeParam}`;
+    downloadWithAuth('/api/reports/export', 'flota_mantenimiento.csv').catch((err) =>
+      window.alert(err instanceof Error ? err.message : 'No se pudo descargar el reporte.')
+    );
   };
 
   const handleCreateRoleSubmit = async (e: React.FormEvent) => {
@@ -477,7 +476,8 @@ export function ReportsSecurityView({
             />
             <input
               type="password"
-              placeholder="Contraseña inicial"
+              placeholder="Contraseña inicial (mín. 10, letras y números)"
+              autoComplete="new-password"
               value={userForm.password}
               onChange={(e) => setUserForm((p) => ({ ...p, password: e.target.value }))}
               className="px-3 py-2 bg-[#11192C] border border-slate-800 rounded-lg text-slate-100"

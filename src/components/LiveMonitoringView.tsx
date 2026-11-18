@@ -24,7 +24,7 @@ import type {
 import {
   ASSET_TYPE_LABELS,
   formatRelativeTime,
-  getAuthToken,
+  downloadWithAuth,
   LINK_META,
   MAINTENANCE_META,
   STATUS_META,
@@ -110,8 +110,9 @@ export function LiveMonitoringView({
   const canRequestVideo = activeRole.permissions.video === 'full' || activeRole.permissions.video === 'write';
 
   const handleDownloadUnitCsv = (vehicleId: string) => {
-    const token = getAuthToken() ?? '';
-    window.location.href = `/api/vehicles/${vehicleId}/export?format=csv&token=${encodeURIComponent(token)}`;
+    downloadWithAuth(`/api/vehicles/${vehicleId}/export?format=csv`, `${vehicleId}.csv`).catch((err) =>
+      window.alert(err instanceof Error ? err.message : 'No se pudo descargar el archivo.')
+    );
   };
 
   return (
