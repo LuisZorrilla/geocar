@@ -10,6 +10,7 @@ import SimpleMarkerSymbol from '@arcgis/core/symbols/SimpleMarkerSymbol.js';
 import TextSymbol from '@arcgis/core/symbols/TextSymbol.js';
 import { Compass, Layers, LocateFixed, ZoomIn, ZoomOut } from 'lucide-react';
 import type { Vehicle } from '../shared/types.ts';
+import { MAP_REGION } from '../shared/region.ts';
 import { ASSET_TYPE_LABELS, STATUS_META } from '../lib/api.ts';
 
 export type MapBasemapMode = 'dark-gray-canvas' | 'imagery' | 'gis';
@@ -67,14 +68,7 @@ function createArcGISBasemap(mode: 'dark-gray-canvas' | 'imagery'): Basemap {
   });
 }
 
-const REFERENCE_HUBS = [
-  { name: 'Monterrey', lat: 25.6866, lng: -100.3161 },
-  { name: 'Saltillo', lat: 25.4232, lng: -100.9924 },
-  { name: 'León', lat: 21.125, lng: -101.686 },
-  { name: 'Guadalajara', lat: 20.6597, lng: -103.3496 },
-  { name: 'Querétaro', lat: 20.5888, lng: -100.3899 },
-  { name: 'CDMX', lat: 19.4326, lng: -99.1332 },
-];
+const REFERENCE_HUBS = MAP_REGION.hubs.map((h) => ({ name: h.city, lat: h.lat, lng: h.lng }));
 
 export function FleetMap({ vehicles, selectedVehicleId, onSelectVehicle }: FleetMapProps) {
   const webglAvailable = useMemo(() => detectWebGLSupport(), []);
@@ -92,7 +86,7 @@ export function FleetMap({ vehicles, selectedVehicleId, onSelectVehicle }: Fleet
   }, [onSelectVehicle]);
 
   const initialCenter = useMemo(() => {
-    if (vehicles.length === 0) return { lat: 22.3, lng: -100.8 };
+    if (vehicles.length === 0) return MAP_REGION.center;
     const avgLat = vehicles.reduce((acc, v) => acc + v.lat, 0) / vehicles.length;
     const avgLng = vehicles.reduce((acc, v) => acc + v.lng, 0) / vehicles.length;
     return { lat: avgLat, lng: avgLng };
@@ -123,7 +117,7 @@ export function FleetMap({ vehicles, selectedVehicleId, onSelectVehicle }: Fleet
         container: mapContainerRef.current,
         map: arcgisMap,
         center: [initialCenter.lng, initialCenter.lat],
-        zoom: 6,
+        zoom: MAP_REGION.zoom,
         ui: { components: [] },
         constraints: { minZoom: 3, maxZoom: 19 },
         popupEnabled: false,
@@ -309,7 +303,7 @@ export function FleetMap({ vehicles, selectedVehicleId, onSelectVehicle }: Fleet
 
   const handleRecenter = () => {
     if (mapMode !== 'gis' && viewRef.current) {
-      viewRef.current.goTo({ center: [initialCenter.lng, initialCenter.lat], zoom: 6 }, { duration: 500 }).catch(() => {});
+      viewRef.current.goTo({ center: [initialCenter.lng, initialCenter.lat], zoom: MAP_REGION.zoom }, { duration: 500 }).catch(() => {});
     } else {
       setGisCenter(initialCenter);
       setGisZoom(1.25);
@@ -317,8 +311,8 @@ export function FleetMap({ vehicles, selectedVehicleId, onSelectVehicle }: Fleet
   };
 
   const projectPoint = (lat: number, lng: number) => {
-    const spanLng = 9.0 / gisZoom;
-    const spanLat = 8.4 / gisZoom;
+    const spanLng = MAP_REGION.gisSpan.lng / gisZoom;
+    const spanLat = MAP_REGION.gisSpan.lat / gisZoom;
     const x = ((lng - (gisCenter.lng - spanLng / 2)) / spanLng) * 1000;
     const y = ((gisCenter.lat + spanLat / 2 - lat) / spanLat) * 600;
     return { x, y };

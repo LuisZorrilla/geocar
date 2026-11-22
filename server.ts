@@ -3,10 +3,20 @@ import express from 'express';
 import path from 'path';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import type { ModulePermissions, RoleDefinition, Tenant } from './src/shared/types.ts';
+import type { AlertPriority, ModulePermissions, RoleDefinition, Tenant } from './src/shared/types.ts';
 import { DomainError, fleetStore, type ActiveSession } from './server/store.ts';
 import * as schemas from './server/validation/schemas.ts';
 import { parseBody } from './server/validation/http.ts';
+import { traccarIngestRouter } from './server/ingest/traccar.ts';
+import { tenantNameResolver, workOrdersToCsv } from './server/export/workOrders.ts';
+import { parseFormat, type ExportFormat } from './server/export/report.ts';
+import { alertsReport, fleetReport, vehicleReport, workOrdersReport, type ExportContext } from './server/export/reports.ts';
+import { exportFileBase, respondWithReport, type ExportActor } from './server/export/send.ts';
+import { DriverError, registerDriverRoutes } from './server/drivers/routes.ts';
+import { CurrencyError } from './server/currency/service.ts';
+import { registerCurrencyRoutes } from './server/currency/routes.ts';
+import * as traccar from './server/traccar/client.ts';
+import { findObdCommand } from './src/shared/teltonika.ts';
 
 const PORT = Number(process.env.PORT || 3000);
 
@@ -41,7 +51,28 @@ function requireAuth(req: express.Request, res: express.Response): AuthContext |
     res.status(401).json({ error: 'Sesión no válida o expirada. Inicia sesión nuevamente.' });
     return null;
   }
+  // Temporary password: only the bootstrap (to know who is logged in) and the password change are allowed.
+  if (resolved.user.mustChangePassword && !PASSWORD_CHANGE_ALLOWED.has(req.path)) {
+    res.status(403).json({
+      code: 'PASSWORD_CHANGE_REQUIRED',
+      error: 'Debes cambiar tu contraseña temporal antes de continuar.',
+    });
+    return null;
+  }
   return resolved;
+}
+
+const PASSWORD_CHANGE_ALLOWED = new Set(['/api/bootstrap', '/api/auth/change-password']);
+
+/** Company management is reserved to the global superadmin. */
+function requireSuperadmin(req: express.Request, res: express.Response): AuthContext | null {
+  const ctx = requireAuth(req, res);
+  if (!ctx) return null;
+  if (!ctx.user.isHiddenSuperadmin) {
+    res.status(403).json({ error: 'Solo el superadmin de la plataforma puede gestionar empresas.' });
+    return null;
+  }
+  return ctx;
 }
 
 function hasWritePermission(role: RoleDefinition, module: keyof ModulePermissions): boolean {
@@ -54,6 +85,31 @@ function getRequestedScope(req: express.Request, ctx: AuthContext): string | und
   const fromQuery = typeof req.query.scopeTenantId === 'string' ? req.query.scopeTenantId.trim() : '';
   const fromHeader = typeof req.headers['x-tenant-scope'] === 'string' ? req.headers['x-tenant-scope'].trim() : '';
   return fromQuery || fromHeader || 'all';
+}
+
+const ALERT_PRIORITIES = new Set<AlertPriority>(['critica', 'alta', 'media', 'informativa']);
+
+function exportActor(ctx: AuthContext): ExportActor {
+  return { tenantId: ctx.tenant.id, name: ctx.user.name, role: ctx.role.name, hidden: Boolean(ctx.user.isHiddenSuperadmin) };
+}
+
+/** Company label and per-row company names for an export ("Todas las empresas" when the superadmin exports all). */
+function exportContext(ctx: AuthContext, data: { tenant: { id: string; name: string }; availableTenants?: { id: string; name: string }[] }): ExportContext {
+  const all = data.tenant.id === 'all';
+  return {
+    company: all ? 'Todas las empresas' : data.tenant.name,
+    generatedBy: ctx.user.name,
+    multiTenant: all,
+    tenantName: tenantNameResolver((data.availableTenants ?? [data.tenant]) as Tenant[], data.tenant.name),
+    currencyOf: (tenantId) => fleetStore.currency.find(fleetStore.currency.tenantCurrency(tenantId)) ?? null,
+    ...(all
+      ? {
+          reference: fleetStore.currency.find(fleetStore.currency.platformReferenceCurrency),
+          toReference: (tenantId: string, amount: number, dateIso: string) =>
+            fleetStore.currency.convertTenantAmount(tenantId, amount, fleetStore.currency.platformReferenceCurrency, dateIso),
+        }
+      : {}),
+  };
 }
 
 /**
@@ -73,6 +129,19 @@ function targetTenantOrFail(req: express.Request, res: express.Response, ctx: Au
 
 async function startServer() {
   await fleetStore.init();
+  // Documents expire with the calendar: re-evaluate drivers at startup and every hour.
+  fleetStore.driverRegistry.sweep();
+  setInterval(() => fleetStore.driverRegistry.sweep(), 60 * 60 * 1000).unref();
+  // OBD-II history keeps 90 days.
+  const purgeObd = () =>
+    fleetStore
+      .purgeObdHistory()
+      .then((n) => n && console.log(`[obd] historial: ${n} muestras de más de 90 días borradas`))
+      .catch((err) => console.error('[obd] purga del historial:', err));
+  void purgeObd();
+  setInterval(purgeObd, 24 * 60 * 60 * 1000).unref();
+  // Driver phones: «sin señal» alerts when a unit depends on a silent phone.
+  setInterval(() => fleetStore.sweepPhones(), 60 * 1000).unref();
 
   const app = express();
   const isProd = process.env.NODE_ENV === 'production';
@@ -112,6 +181,9 @@ async function startServer() {
     res.send = ((body: unknown) => afterFlush(() => originalSend(body))) as typeof res.send;
     next();
   });
+
+  // Traccar → platform (internal network; shared-secret auth, no user session)
+  app.use('/ingest/traccar', traccarIngestRouter);
 
   const authLimiter = rateLimit({
     windowMs: 15 * 60_000,
@@ -194,6 +266,9 @@ async function startServer() {
       vehicles,
       workOrders: data?.workOrders ?? [],
       maintenanceDashboard: data?.maintenanceDashboard,
+      // Alerts arrive from Traccar at any time (SOS, alarms): refresh them with the live tick.
+      alerts: data?.alerts,
+      incidents: data?.incidents,
       updatedAt: new Date().toISOString(),
     });
   });
@@ -319,41 +394,58 @@ async function startServer() {
   });
 
   // Vehicles & Heavy Machinery
-  app.post('/api/vehicles', (req, res) => {
-    const ctx = requireAuth(req, res);
-    if (!ctx) return;
-    if (!hasWritePermission(ctx.role, 'flotas')) {
-      res.status(403).json({ error: 'Tu perfil no tiene permisos para registrar unidades.' });
-      return;
+  app.post('/api/vehicles', async (req, res, next) => {
+    try {
+      const ctx = requireAuth(req, res);
+      if (!ctx) return;
+      if (!hasWritePermission(ctx.role, 'flotas')) {
+        res.status(403).json({ error: 'Tu perfil no tiene permisos para registrar unidades.' });
+        return;
+      }
+      const body = parseBody(schemas.createVehicle, req, res);
+      if (!body) return;
+      const targetTenantId = targetTenantOrFail(req, res, ctx);
+      if (!targetTenantId) return;
+      const targetTenant = fleetStore.getTenantById(targetTenantId) ?? ctx.tenant;
+      const created = fleetStore.createVehicle(
+        targetTenantId,
+        {
+          branch: String(body.branch || targetTenant.branches[0]),
+          group: String(body.group || ''),
+          assetType: body.assetType === 'maquinaria_pesada' ? 'maquinaria_pesada' : 'vehiculo',
+          unitCode: String(body.unitCode),
+          plate: String(body.plate),
+          brandModel: String(body.brandModel || 'Sin especificar'),
+          brand: body.brand,
+          model: body.model,
+          year: Number(body.year || new Date().getFullYear()),
+          driverName: String(body.driverName || 'Operador Asignado'),
+          imei: body.imei ?? '',
+          protocol: body.protocol === 'Traccar' || body.connection === 'obd' || body.connection === 'smartphone' ? 'Traccar' : 'JT808/JT1078',
+          connection: body.connection,
+          deviceModel: String(body.deviceModel || ''),
+          deviceCatalogId: body.deviceCatalogId,
+          driverId: body.driverId,
+          engineHours: Number(body.engineHours || 120),
+          odometerKm: Number(body.odometerKm || 1200),
+        },
+        ctx.user.name,
+        ctx.role.name
+      );
+      // OBD-II tracker: create it in Traccar right away, as the OBD wizard does.
+      if (body.connection === 'obd' && created.device) {
+        await provisionInTraccar(created.device.id, created.device.imei, created.device.unitCode);
+      }
+      const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+      const device = created.device ? (data?.devices.find((d) => d.id === created.device!.id) ?? created.device) : null;
+      res.status(201).json({ ...created, device, auditLogs: data?.auditLogs ?? [] });
+    } catch (err) {
+      next(err);
     }
-    const body = parseBody(schemas.createVehicle, req, res);
-    if (!body) return;
-    const targetTenantId = targetTenantOrFail(req, res, ctx);
-    if (!targetTenantId) return;
-    const targetTenant = fleetStore.getTenantById(targetTenantId) ?? ctx.tenant;
-    const created = fleetStore.createVehicle(
-      targetTenantId,
-      {
-        branch: String(body.branch || targetTenant.branches[0]),
-        group: String(body.group || 'Operación General'),
-        assetType: body.assetType === 'maquinaria_pesada' ? 'maquinaria_pesada' : 'vehiculo',
-        unitCode: String(body.unitCode),
-        plate: String(body.plate),
-        brandModel: String(body.brandModel || 'Kenworth T680'),
-        year: Number(body.year || 2025),
-        driverName: String(body.driverName || 'Operador Asignado'),
-        imei: String(body.imei),
-        protocol: body.protocol === 'Traccar' ? 'Traccar' : 'JT808/JT1078',
-        deviceModel: String(body.deviceModel || 'Howen Hero-ME40-04'),
-        engineHours: Number(body.engineHours || 120),
-        odometerKm: Number(body.odometerKm || 1200),
-      },
-      ctx.user.name,
-      ctx.role.name
-    );
-    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
-    res.status(201).json({ ...created, auditLogs: data?.auditLogs ?? [] });
   });
+
+  registerDriverRoutes(app, { requireAuth, getRequestedScope, targetTenantOrFail });
+  registerCurrencyRoutes(app, { requireAuth });
 
   app.get('/api/vehicles/:id/dossier', (req, res) => {
     const ctx = requireAuth(req, res);
@@ -370,7 +462,8 @@ async function startServer() {
     res.json(dossier);
   });
 
-  app.get('/api/vehicles/:id/export', (req, res) => {
+  // Unit dossier as PDF, Excel or CSV (?format=pdf|xlsx|csv, CSV by default).
+  app.get('/api/vehicles/:id/export', (req, res, next) => {
     const ctx = requireAuth(req, res);
     if (!ctx) return;
     const dossier = fleetStore.getVehicleDossier(
@@ -383,42 +476,14 @@ async function startServer() {
       return;
     }
     const tenantName = fleetStore.getTenantById(dossier.vehicle.tenantId)?.name ?? ctx.tenant.name;
-    const format = req.query.format === 'json' ? 'json' : 'csv';
-    if (format === 'json') {
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.setHeader('Content-Disposition', `attachment; filename="${dossier.vehicle.unitCode}_ficha_operativa.json"`);
-      res.send(JSON.stringify({ empresa: tenantName, exportadoEn: new Date().toISOString(), ...dossier }, null, 2));
-      return;
-    }
-    const v = dossier.vehicle;
-    const faultsStr = v.faultCodes.map((f) => `${f.code}: ${f.description}`).join(' | ') || 'Sin fallas';
-    const header =
-      'Unidad,Tipo_Activo,Placa,Marca_Modelo,Empresa,Sucursal,Conductor,Estado_Operativo,Horometro_h,Proximo_Servicio_h,Proximo_Servicio_Fecha,Odometro_km,Proximo_Servicio_km,Estado_Mantenimiento,Combustible_pct,RPM,Temp_C,Codigos_Falla,Lat,Lng\n';
-    const row = [
-      v.unitCode,
-      v.assetType,
-      v.plate,
-      `"${v.brandModel}"`,
-      `"${tenantName}"`,
-      `"${v.branch}"`,
-      `"${v.driverName}"`,
-      v.operationalStatus,
-      v.engineHours,
-      v.nextServiceHours,
-      v.nextServiceDate,
-      v.odometerKm,
-      v.nextServiceKm,
-      v.maintenanceStatus,
-      v.fuelLevelPct,
-      v.rpm,
-      v.coolantTempC,
-      `"${faultsStr}"`,
-      v.lat,
-      v.lng,
-    ].join(',');
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="${v.unitCode}_ficha_mantenimiento.csv"`);
-    res.send(header + row);
+    const report = vehicleReport(dossier, {
+      company: tenantName,
+      generatedBy: ctx.user.name,
+      multiTenant: false,
+      tenantName: () => tenantName,
+    });
+    const format = parseFormat(req.query.format);
+    void respondWithReport(res, next, exportActor(ctx), report, format, exportFileBase(`ficha-${dossier.vehicle.unitCode}`, tenantName), 'Flotas y Maquinaria');
   });
 
   app.post('/api/maintenance', (req, res) => {
@@ -430,7 +495,7 @@ async function startServer() {
     }
     const body = parseBody(schemas.addMaintenance, req, res);
     if (!body) return;
-    const { vehicleId, type, title, workshopOrTech, costMxn, notes, nextServiceDate, clearFaults } = body;
+    const { vehicleId, type, title, workshopOrTech, cost, notes, nextServiceDate, clearFaults } = body;
     const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
     const result = fleetStore.addMaintenanceRecord(
       ctx.tenant.id,
@@ -439,7 +504,7 @@ async function startServer() {
         type: type === 'correctivo' || type === 'inspeccion' ? type : 'preventivo',
         title: String(title),
         workshopOrTech: String(workshopOrTech || 'Taller Interno'),
-        costMxn: Number(costMxn || 0),
+        cost: Number(cost || 0),
         notes: String(notes || ''),
         nextServiceDate: typeof nextServiceDate === 'string' ? nextServiceDate : undefined,
         clearFaults: Boolean(clearFaults),
@@ -512,7 +577,8 @@ async function startServer() {
         workshopOrTech: String(body.workshopOrTech || 'Taller Central Certificado'),
         scheduledDate: String(body.scheduledDate || new Date().toISOString().slice(0, 10)),
         parts: body.parts ?? [],
-        laborCostMxn: Number(body.laborCostMxn || 0),
+        laborCost: Number(body.laborCost || 0),
+        laborCurrency: body.laborCurrency,
         notes: String(body.notes || ''),
         clearFaultsOnClose: Boolean(body.clearFaultsOnClose ?? true),
       },
@@ -533,6 +599,33 @@ async function startServer() {
       maintenanceDashboard: data?.maintenanceDashboard,
       auditLogs: data?.auditLogs ?? [],
     });
+  });
+
+  // All work orders (any status) for the company in scope, as PDF, Excel or CSV.
+  // The CSV keeps its original columns (WORK_ORDER_CSV_HEADER) for whoever already imports it.
+  app.get('/api/work-orders/export', (req, res, next) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (ctx.role.permissions.flotas === 'none') {
+      res.status(403).json({ error: 'Tu perfil no tiene acceso a las órdenes de trabajo.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    if (!data) {
+      res.status(404).json({ error: 'Empresa o usuario no disponible.' });
+      return;
+    }
+    const ectx = exportContext(ctx, data);
+    const format = parseFormat(req.query.format);
+    const fileBase = exportFileBase('ordenes-trabajo', ectx.multiTenant ? 'todas' : data.tenant.name);
+    if (format === 'csv') {
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileBase}.csv"`);
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(workOrdersToCsv(data.workOrders, ectx.tenantName, (id) => fleetStore.currency.tenantCurrency(id)));
+      return;
+    }
+    void respondWithReport(res, next, exportActor(ctx), workOrdersReport(data.workOrders, ectx), format, fileBase, 'Mantenimiento');
   });
 
   app.patch('/api/work-orders/:id', (req, res) => {
@@ -590,7 +683,7 @@ async function startServer() {
         intervalHours: Number(body.intervalHours || 250),
         intervalKm: Number(body.intervalKm || 10000),
         intervalDays: Number(body.intervalDays || 45),
-        estimatedCostMxn: Number(body.estimatedCostMxn || 0),
+        estimatedCost: Number(body.estimatedCost || 0),
         checklistFocus: String(body.checklistFocus || 'Inspección general preventiva.'),
       },
       ctx.user.name,
@@ -744,7 +837,8 @@ async function startServer() {
         unit: String(body.unit || 'pza'),
         stockQty: Number(body.stockQty ?? 0),
         minStock: Number(body.minStock ?? 2),
-        unitCostMxn: Number(body.unitCostMxn ?? 0),
+        unitCost: Number(body.unitCost ?? 0),
+        unitCostCurrency: body.unitCostCurrency,
         warehouseLocation: String(body.warehouseLocation || 'Almacén Central'),
       },
       ctx.user.name,
@@ -1002,6 +1096,404 @@ async function startServer() {
     });
   });
 
+  app.put('/api/devices/:id/connection', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!ctx.user.isHiddenSuperadmin && !hasWritePermission(ctx.role, 'dashcams_config')) {
+      res.status(403).json({ error: 'Tu perfil no puede modificar la conexión de los equipos.' });
+      return;
+    }
+    const body = parseBody(schemas.updateDeviceConnection, req, res);
+    if (!body) return;
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const device = fleetStore.updateDeviceConnection(
+      ctx.tenant.id,
+      req.params.id,
+      body,
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!device) {
+      res.status(404).json({ error: 'Equipo no encontrado en tu empresa.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.json({
+      device,
+      devices: data?.devices ?? [],
+      unmatchedDevices: data?.unmatchedDevices,
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
+  // ---- OBD-II telemetry device of a unit (same permission as the camera connection) -----------
+  const obdResponse = (req: express.Request, ctx: AuthContext) => {
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    return {
+      vehicles: data?.vehicles ?? [],
+      devices: data?.devices ?? [],
+      unmatchedDevices: data?.unmatchedDevices,
+      auditLogs: data?.auditLogs ?? [],
+    };
+  };
+
+  const canConfigObd = (ctx: AuthContext, res: express.Response) => {
+    if (ctx.user.isHiddenSuperadmin || hasWritePermission(ctx.role, 'dashcams_config')) return true;
+    res.status(403).json({ error: 'Tu perfil no puede configurar equipos OBD-II.' });
+    return false;
+  };
+
+  /** Creates (or renames) the tracker in Traccar and records the outcome on the device. Never throws. */
+  const provisionInTraccar = async (deviceId: string, imei: string, unitCode: string) => {
+    if (!traccar.isTraccarConfigured()) {
+      fleetStore.setObdProvisioning(deviceId, {
+        status: 'manual',
+        message: 'La API de Traccar no está configurada: crea el dispositivo en Traccar con Identificador = IMEI.',
+      });
+      return;
+    }
+    try {
+      const t = await traccar.ensureDevice({ uniqueId: imei, name: `${unitCode} OBD` });
+      fleetStore.setObdProvisioning(deviceId, { traccarId: t.id, status: 'pendiente_sms' });
+    } catch (err) {
+      fleetStore.setObdProvisioning(deviceId, { status: 'error', message: err instanceof Error ? err.message : String(err) });
+    }
+  };
+
+  const removeFromTraccar = async (traccarId?: number) => {
+    if (!traccarId || !traccar.isTraccarConfigured()) return;
+    await traccar.deleteDevice(traccarId).catch((err) => console.warn('[obd] no se pudo borrar el equipo en Traccar:', err.message));
+  };
+
+  app.put('/api/vehicles/:id/obd', async (req, res, next) => {
+    try {
+      const ctx = requireAuth(req, res);
+      if (!ctx || !canConfigObd(ctx, res)) return;
+      const body = parseBody(schemas.assignObdDevice, req, res);
+      if (!body) return;
+      const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+      const prev = fleetStore.getObdDevice(ctx.tenant.id, req.params.id, isSuper)?.device;
+      const prevImei = prev?.imei;
+      const prevTraccarId = prev?.traccarId;
+      const device = fleetStore.assignObdDevice(ctx.tenant.id, req.params.id, body, ctx.user.name, ctx.role.name, isSuper, isSuper);
+      if (!device) {
+        res.status(404).json({ error: 'Unidad no encontrada en tu empresa.' });
+        return;
+      }
+      if (prevImei && prevImei !== device.imei) await removeFromTraccar(prevTraccarId);
+      await provisionInTraccar(device.id, device.imei, device.unitCode);
+      res.json({ device, ...obdResponse(req, ctx) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ---- Driver smartphones (Traccar Client) -------------------------------------------
+  /** Creates the phone in Traccar and records the outcome. Never throws. */
+  const provisionPhone = async (driverId: string, identifier: string, driverName: string) => {
+    if (!traccar.isTraccarConfigured()) {
+      fleetStore.setPhoneProvisioning(driverId, {
+        status: 'manual',
+        message: 'La API de Traccar no está configurada: crea el dispositivo en Traccar con Identificador = ' + identifier + '.',
+      });
+      return;
+    }
+    try {
+      const t = await traccar.ensureDevice({ uniqueId: identifier, name: `Celular · ${driverName}` });
+      fleetStore.setPhoneProvisioning(driverId, { traccarId: t.id, status: 'pendiente_app' });
+    } catch (err) {
+      fleetStore.setPhoneProvisioning(driverId, { status: 'error', message: err instanceof Error ? err.message : String(err) });
+    }
+  };
+
+  const phoneScope = (req: express.Request, ctx: AuthContext) =>
+    ctx.user.isHiddenSuperadmin ? (getRequestedScope(req, ctx) ?? 'all') : ctx.tenant.id;
+
+  /** Addresses programmed into the cameras (global: superadmin only). Body { server: { host, jt808Port, videoHost?, jt1078Port } | null }. */
+  app.put('/api/settings/camera-server', async (req, res, next) => {
+    try {
+      const ctx = requireAuth(req, res);
+      if (!ctx) return;
+      if (!ctx.user.isHiddenSuperadmin) {
+        res.status(403).json({ error: 'Solo el superadmin de la plataforma puede cambiar el servidor de las cámaras: es el mismo para todas las empresas.' });
+        return;
+      }
+      const body = parseBody(schemas.cameraServer, req, res);
+      if (!body) return;
+      res.json({ deviceConnection: await fleetStore.setCameraServer(body.server, ctx.user.name, ctx.role.name) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** Host/port programmed into OBD-II trackers (global: superadmin only). Body { server: { host, port } | null }. */
+  app.put('/api/settings/obd-server', async (req, res, next) => {
+    try {
+      const ctx = requireAuth(req, res);
+      if (!ctx) return;
+      if (!ctx.user.isHiddenSuperadmin) {
+        res.status(403).json({ error: 'Solo el superadmin de la plataforma puede cambiar el servidor de los OBD-II: es el mismo para todas las empresas.' });
+        return;
+      }
+      const body = parseBody(schemas.obdServer, req, res);
+      if (!body) return;
+      res.json({ deviceConnection: await fleetStore.setObdServer(body.server, ctx.user.name, ctx.role.name) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** Server URL for Traccar Client (global: superadmin only). Body { url: string | null }. */
+  app.put('/api/settings/phone-server-url', async (req, res, next) => {
+    try {
+      const ctx = requireAuth(req, res);
+      if (!ctx) return;
+      if (!ctx.user.isHiddenSuperadmin) {
+        res.status(403).json({ error: 'Solo el superadmin de la plataforma puede cambiar la URL de los celulares: es la misma para todas las empresas.' });
+        return;
+      }
+      const body = parseBody(schemas.phoneServerUrl, req, res);
+      if (!body) return;
+      res.json({ deviceConnection: await fleetStore.setPhoneServerUrl(body.url, ctx.user.name, ctx.role.name) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/phones', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!ctx.user.isHiddenSuperadmin && (ctx.role.permissions.dashcams_config ?? 'none') === 'none') {
+      res.status(403).json({ error: 'Tu perfil no puede ver los celulares de los choferes.' });
+      return;
+    }
+    res.json({ phones: fleetStore.listPhones(phoneScope(req, ctx)), traccarApi: traccar.isTraccarConfigured() });
+  });
+
+  app.put('/api/drivers/:id/phone', async (req, res, next) => {
+    try {
+      const ctx = requireAuth(req, res);
+      if (!ctx || !canConfigObd(ctx, res)) return;
+      const body = parseBody(schemas.assignDriverPhone, req, res);
+      if (!body) return;
+      const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+      const { driver, oldTraccarId } = fleetStore.assignDriverPhone(ctx.tenant.id, req.params.id, body, ctx.user.name, ctx.role.name, isSuper, isSuper);
+      await removeFromTraccar(oldTraccarId);
+      await provisionPhone(driver.id, driver.phoneTracker!.identifier, driver.name);
+      res.json({ phones: fleetStore.listPhones(phoneScope(req, ctx)), tracker: driver.phoneTracker });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/drivers/:id/phone/sync', async (req, res, next) => {
+    try {
+      const ctx = requireAuth(req, res);
+      if (!ctx || !canConfigObd(ctx, res)) return;
+      const driver = fleetStore.getDriverPhone(ctx.tenant.id, req.params.id, Boolean(ctx.user.isHiddenSuperadmin));
+      if (!driver.phoneTracker) {
+        res.status(404).json({ error: 'El chofer no tiene celular conectado.' });
+        return;
+      }
+      await provisionPhone(driver.id, driver.phoneTracker.identifier, driver.name);
+      res.json({ phones: fleetStore.listPhones(phoneScope(req, ctx)), tracker: driver.phoneTracker });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.delete('/api/drivers/:id/phone', async (req, res, next) => {
+    try {
+      const ctx = requireAuth(req, res);
+      if (!ctx || !canConfigObd(ctx, res)) return;
+      const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+      const removed = fleetStore.removeDriverPhone(ctx.tenant.id, req.params.id, ctx.user.name, ctx.role.name, isSuper, isSuper);
+      await removeFromTraccar(removed.traccarId);
+      res.json({ phones: fleetStore.listPhones(phoneScope(req, ctx)) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** Current state of the unit's tracker (polled by the connection wizard and the unit detail). */
+  app.get('/api/vehicles/:id/obd', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    const found = fleetStore.getObdDevice(ctx.tenant.id, req.params.id, Boolean(ctx.user.isHiddenSuperadmin));
+    if (!found) {
+      res.status(404).json({ error: 'Unidad no encontrada en tu empresa.' });
+      return;
+    }
+    res.json({ vehicle: found.vehicle, device: found.device ?? null, traccarApi: traccar.isTraccarConfigured() });
+  });
+
+  /** Retries the Traccar registration (after fixing credentials or connectivity). */
+  app.post('/api/vehicles/:id/obd/sync', async (req, res, next) => {
+    try {
+      const ctx = requireAuth(req, res);
+      if (!ctx || !canConfigObd(ctx, res)) return;
+      const found = fleetStore.getObdDevice(ctx.tenant.id, req.params.id, Boolean(ctx.user.isHiddenSuperadmin));
+      if (!found?.device) {
+        res.status(404).json({ error: 'La unidad no tiene un equipo OBD-II en tu empresa.' });
+        return;
+      }
+      await provisionInTraccar(found.device.id, found.device.imei, found.device.unitCode);
+      res.json({ device: found.device, ...obdResponse(req, ctx) });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.delete('/api/vehicles/:id/obd', async (req, res, next) => {
+    try {
+      const ctx = requireAuth(req, res);
+      if (!ctx || !canConfigObd(ctx, res)) return;
+      const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+      const removed = fleetStore.removeObdDevice(ctx.tenant.id, req.params.id, ctx.user.name, ctx.role.name, isSuper, isSuper);
+      if (!removed) {
+        res.status(404).json({ error: 'La unidad no tiene un equipo OBD-II en tu empresa.' });
+        return;
+      }
+      await removeFromTraccar(removed.traccarId);
+      res.json(obdResponse(req, ctx));
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** Remote configuration: only the predefined Teltonika commands (no free text). */
+  app.post('/api/vehicles/:id/obd/commands', async (req, res, next) => {
+    try {
+      const ctx = requireAuth(req, res);
+      if (!ctx || !canConfigObd(ctx, res)) return;
+      const body = parseBody(schemas.obdCommand, req, res);
+      if (!body) return;
+      const def = findObdCommand(body.commandId);
+      const text = def?.build(body.option);
+      if (!def || !text) {
+        res.status(400).json({ error: 'Comando u opción no válidos.' });
+        return;
+      }
+      const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+      const found = fleetStore.getObdDevice(ctx.tenant.id, req.params.id, isSuper);
+      if (!found?.device) {
+        res.status(404).json({ error: 'La unidad no tiene un equipo OBD-II en tu empresa.' });
+        return;
+      }
+      const dev = found.device;
+      if (!dev.traccarId || !traccar.isTraccarConfigured()) {
+        res.status(409).json({ error: 'El equipo no está dado de alta en Traccar desde el panel. Usa «Reintentar alta» primero.' });
+        return;
+      }
+      const label = def.options ? `${def.label}: ${def.options.find((o) => o.id === body.option)?.label ?? ''}` : def.label;
+      let status: 'enviado' | 'en_cola' | 'error';
+      let response: string | undefined;
+      try {
+        status = await traccar.sendCustomCommand(dev.traccarId, text);
+      } catch (err) {
+        status = 'error';
+        response = err instanceof Error ? err.message : String(err);
+      }
+      const entry = fleetStore.recordObdCommand(
+        dev.id,
+        { actorName: ctx.user.name, commandId: def.id, label, text, status, response },
+        ctx.role.name,
+        isSuper
+      );
+      res.status(status === 'error' ? 502 : 200).json({
+        entry,
+        error: status === 'error' ? `No se pudo enviar el comando. ${response}` : undefined,
+        ...obdResponse(req, ctx),
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/vehicles/:id/obd/history', async (req, res, next) => {
+    try {
+      const ctx = requireAuth(req, res);
+      if (!ctx) return;
+      const range = req.query.range === '7d' || req.query.range === '30d' ? req.query.range : '24h';
+      const points = await fleetStore.getObdHistory(ctx.tenant.id, req.params.id, range, Boolean(ctx.user.isHiddenSuperadmin));
+      if (!points) {
+        res.status(404).json({ error: 'Unidad no encontrada en tu empresa.' });
+        return;
+      }
+      res.json({ range, points });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/vehicles/:id/obd/faults', async (req, res, next) => {
+    try {
+      const ctx = requireAuth(req, res);
+      if (!ctx) return;
+      const faults = await fleetStore.getObdFaultHistory(ctx.tenant.id, req.params.id, Boolean(ctx.user.isHiddenSuperadmin));
+      if (!faults) {
+        res.status(404).json({ error: 'Unidad no encontrada en tu empresa.' });
+        return;
+      }
+      res.json({ faults });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // ---- Companies (superadmin only) ------------------------------------------------
+  app.get('/api/tenants', (req, res) => {
+    if (!requireSuperadmin(req, res)) return;
+    res.json({ tenants: fleetStore.listTenantSummaries() });
+  });
+
+  app.get('/api/tenants/availability', (req, res) => {
+    if (!requireSuperadmin(req, res)) return;
+    const q = (k: string) => (typeof req.query[k] === 'string' ? String(req.query[k]).slice(0, 160) : undefined);
+    res.json(fleetStore.checkTenantAvailability({ cuit: q('cuit'), username: q('username'), name: q('name'), exceptTenantId: q('except') }));
+  });
+
+  app.post('/api/tenants', async (req, res, next) => {
+    try {
+      const ctx = requireSuperadmin(req, res);
+      if (!ctx) return;
+      const body = parseBody(schemas.createTenant, req, res);
+      if (!body) return;
+      const result = await fleetStore.createTenantWithAdmin(body, ctx.user.name);
+      res.setHeader('Cache-Control', 'no-store'); // contains the temporary password
+      res.status(201).json({ ...result, tenants: fleetStore.listTenantSummaries() });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.patch('/api/tenants/:id', async (req, res, next) => {
+    try {
+      const ctx = requireSuperadmin(req, res);
+      if (!ctx) return;
+      const body = parseBody(schemas.updateTenant, req, res);
+      if (!body) return;
+      const tenant = await fleetStore.updateTenant(req.params.id, body, ctx.user.name);
+      res.json({ tenant, tenants: fleetStore.listTenantSummaries() });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/tenants/:id/reset-admin-password', async (req, res, next) => {
+    try {
+      const ctx = requireSuperadmin(req, res);
+      if (!ctx) return;
+      const result = await fleetStore.resetTenantAdminPassword(req.params.id, ctx.user.name);
+      res.setHeader('Cache-Control', 'no-store');
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  });
+
   app.post('/api/alerts/:id/acknowledge', (req, res) => {
     const ctx = requireAuth(req, res);
     if (!ctx) return;
@@ -1216,48 +1708,50 @@ async function startServer() {
     res.json({ sizing, auditLogs: data?.auditLogs ?? [] });
   });
 
-  app.get('/api/reports/export', (req, res) => {
+  // Fleet report (every unit in scope) as PDF, Excel or CSV.
+  app.get('/api/reports/export', (req, res, next) => {
     const ctx = requireAuth(req, res);
     if (!ctx) return;
-    const scope = getRequestedScope(req, ctx);
-    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, scope);
-    const vehicles = data?.vehicles ?? [];
-    const header =
-      'Unidad,Tipo_Activo,Placa,Empresa,Sucursal,Conductor,Estado,Velocidad_kmh,Horometro_h,Proximo_Servicio_h,Proximo_Servicio_Fecha,Estado_Mantto,Fallas_DTC,Lat,Lng,Odometro_km\n';
-    const rows = vehicles
-      .map((v) => {
-        const tName = fleetStore.getTenantById(v.tenantId)?.name ?? ctx.tenant.name;
-        return [
-          v.unitCode,
-          v.assetType,
-          v.plate,
-          `"${tName}"`,
-          `"${v.branch}"`,
-          `"${v.driverName}"`,
-          v.operationalStatus,
-          v.speedKmh,
-          v.engineHours,
-          v.nextServiceHours,
-          v.nextServiceDate,
-          v.maintenanceStatus,
-          v.faultCodes.length,
-          v.lat,
-          v.lng,
-          v.odometerKm,
-        ].join(',');
-      })
-      .join('\n');
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    if (!data) {
+      res.status(404).json({ error: 'Empresa o usuario no disponible.' });
+      return;
+    }
+    const ectx = exportContext(ctx, data);
+    const format = parseFormat(req.query.format);
+    const fileBase = exportFileBase('flota', ectx.multiTenant ? 'todas' : data.tenant.name);
+    void respondWithReport(res, next, exportActor(ctx), fleetReport(data.vehicles, ectx), format, fileBase, 'Perfiles y Reportes');
+  });
 
-    const exportScopeName = scope ?? ctx.tenant.id;
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="${exportScopeName}_flota_mantenimiento.csv"`);
-    res.send(header + rows);
+  // Alerts (and incidents, when the profile can see them) as PDF, Excel or CSV. ?priority= filters both.
+  app.get('/api/alerts/export', (req, res, next) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (ctx.role.permissions.alertas === 'none') {
+      res.status(403).json({ error: 'Tu perfil no tiene acceso a las alertas.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    if (!data) {
+      res.status(404).json({ error: 'Empresa o usuario no disponible.' });
+      return;
+    }
+    const priority = ALERT_PRIORITIES.has(req.query.priority as AlertPriority) ? (req.query.priority as AlertPriority) : undefined;
+    const incidents = ctx.role.permissions.incidentes === 'none' ? null : data.incidents;
+    const ectx = exportContext(ctx, data);
+    const report = alertsReport(data.alerts, incidents, { priority }, ectx);
+    const format = parseFormat(req.query.format);
+    void respondWithReport(res, next, exportActor(ctx), report, format, exportFileBase('alertas', ectx.multiTenant ? 'todas' : data.tenant.name), 'Alertas e Incidentes');
   });
 
   app.use('/api', (err: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
     if (res.headersSent) return next(err);
-    if (err instanceof DomainError) {
+    if (err instanceof DomainError || err instanceof DriverError || err instanceof CurrencyError) {
       res.status(err.status).json({ error: err.message });
+      return;
+    }
+    if ((err as { type?: string } | null)?.type === 'entity.too.large') {
+      res.status(413).json({ error: 'El archivo supera el tamaño máximo permitido (5 MB).' });
       return;
     }
     if (err instanceof SyntaxError && 'body' in err) {
@@ -1284,8 +1778,18 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Vigilant FleetOps listening on http://localhost:${PORT}`);
+    console.log(`Vigilant GeoCar listening on http://localhost:${PORT}`);
   });
+
+  // Save buffered GPS positions before exiting (docker stop / systemd send SIGTERM).
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+    process.once(signal, () => {
+      fleetStore
+        .shutdown()
+        .catch((err) => console.error('[shutdown] No se pudo guardar el estado pendiente:', err))
+        .finally(() => process.exit(0));
+    });
+  }
 }
 
 startServer().catch((err) => {

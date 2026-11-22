@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react';
+import { useMoney } from '../lib/money.tsx';
 import {
   AlertTriangle,
   CalendarClock,
@@ -43,6 +44,16 @@ export function MaintenanceDashboardView({
 }: MaintenanceDashboardViewProps) {
   const monthlyCosts = metrics?.monthlyCosts ?? [];
   const corridorMetrics = metrics?.corridorMetrics ?? [];
+  const money = useMoney();
+  // The metrics come in one currency: the company's, or the platform reference one in the consolidated view.
+  const cur = metrics?.currency ?? money.currencyOf()?.code ?? null;
+  const fm = (n: number, opts?: { compact?: boolean }) => money.fmtIn(n, cur, opts);
+  const curCode = cur ?? 'sin moneda';
+  /** Short axis label in the metrics currency: "US$1k", "$250k", "CLP$80". */
+  const axisTick = (v: number) => {
+    const sym = money.find(cur)?.symbol ?? '';
+    return v >= 1000 ? `${sym}${Math.round(v / 1000).toLocaleString('es-AR')}k` : `${sym}${Math.round(v)}`;
+  };
 
   const [selectedMonthKey, setSelectedMonthKey] = useState<string | null>(null);
   const activeMonth =
@@ -78,16 +89,16 @@ export function MaintenanceDashboardView({
 
   const maxMonthlyTotal = Math.max(
     1,
-    ...monthlyCosts.map((m) => m.totalMxn)
+    ...monthlyCosts.map((m) => m.total)
   );
 
   const sixMonthTotals = useMemo(() => {
     return monthlyCosts.reduce(
       (acc, m) => ({
-        refacciones: acc.refacciones + m.refaccionesMxn,
-        insumos: acc.insumos + m.insumosMxn,
-        manoObra: acc.manoObra + m.manoObraMxn,
-        total: acc.total + m.totalMxn,
+        refacciones: acc.refacciones + m.refacciones,
+        insumos: acc.insumos + m.insumos,
+        manoObra: acc.manoObra + m.manoObra,
+        total: acc.total + m.total,
         orders: acc.orders + m.ordersCount,
       }),
       { refacciones: 0, insumos: 0, manoObra: 0, total: 0, orders: 0 }
@@ -104,7 +115,7 @@ export function MaintenanceDashboardView({
   const faultUnitsCount =
     metrics?.criticalFaultUnitsCount ??
     vehicles.filter((v) => v.faultCodes.length > 0).length;
-  const currentMonthTotal = metrics?.currentMonthTotalMxn ?? (monthlyCosts[monthlyCosts.length - 1]?.totalMxn ?? 0);
+  const currentMonthTotal = metrics?.currentMonthTotal ?? (monthlyCosts[monthlyCosts.length - 1]?.total ?? 0);
   const insideCorridor = metrics?.unitsInsideCorridor ?? vehicles.length;
   const outsideCorridor = metrics?.unitsOutsideCorridor ?? 0;
   const avgDistKm = metrics?.avgDistanceToHubKm ?? 0;
@@ -165,15 +176,21 @@ export function MaintenanceDashboardView({
           </div>
           <div className="mt-2 flex items-baseline justify-between gap-2">
             <div className="text-2xl font-semibold font-mono tabular-nums text-emerald-400">
-              ${currentMonthTotal.toLocaleString('es-MX')}
+              {fm(currentMonthTotal)}
             </div>
             <span className={`text-xs font-mono ${lowStockCount > 0 ? 'text-rose-400' : 'text-slate-400'}`}>
               {lowStockCount > 0 ? `${lowStockCount} SKU bajo mín.` : 'Stock óptimo'}
             </span>
           </div>
           <div className="mt-2 text-[11px] font-mono tabular-nums text-slate-400 truncate">
-            Acumulado 6m: ${sixMonthTotals.total.toLocaleString('es-MX')} MXN ({sixMonthTotals.orders} OT)
+            Acumulado 6m: {fm(sixMonthTotals.total)} {curCode} ({sixMonthTotals.orders} OT)
           </div>
+          {metrics?.consolidated && (
+            <div className="mt-1 text-[10px] text-slate-500" title="Cada orden se convierte con el tipo de cambio de su fecha">
+              Consolidado en {curCode} con el TC de la fecha de cada orden
+              {metrics.excludedOrders ? ` · ${metrics.excludedOrders} OT sin TC fuera de la suma` : ''}
+            </div>
+          )}
         </div>
 
         <div className="bg-[#11192C] border border-slate-800/80 rounded-xl p-4 flex flex-col justify-between">
@@ -205,7 +222,7 @@ export function MaintenanceDashboardView({
                 Costos mensuales de mantenimiento (últimos 6 meses)
               </h3>
               <p className="text-xs text-slate-400">
-                Desglose acumulado en refacciones, insumos y mano de obra (MXN) · Haz clic en un mes para inspeccionar
+                Desglose acumulado en refacciones, insumos y mano de obra ({curCode}) · Haz clic en un mes para inspeccionar
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-3 text-xs">
@@ -239,7 +256,7 @@ export function MaintenanceDashboardView({
                 {/* Horizontal Grid Lines */}
                 {[0, 0.25, 0.5, 0.75, 1].map((ratio) => {
                   const y = 185 - ratio * 150;
-                  const val = Math.round((maxMonthlyTotal * ratio) / 1000);
+                  const val = axisTick(maxMonthlyTotal * ratio);
                   return (
                     <g key={ratio}>
                       <line
@@ -259,7 +276,7 @@ export function MaintenanceDashboardView({
                         fontSize={10}
                         fontFamily="ui-monospace, monospace"
                       >
-                        ${val}k
+                        {val}
                       </text>
                     </g>
                   );
@@ -271,9 +288,9 @@ export function MaintenanceDashboardView({
                   const barWidth = Math.min(54, slotWidth * 0.54);
                   const x = 68 + idx * slotWidth + (slotWidth - barWidth) / 2;
 
-                  const hRef = (m.refaccionesMxn / maxMonthlyTotal) * 150;
-                  const hIns = (m.insumosMxn / maxMonthlyTotal) * 150;
-                  const hLab = (m.manoObraMxn / maxMonthlyTotal) * 150;
+                  const hRef = (m.refacciones / maxMonthlyTotal) * 150;
+                  const hIns = (m.insumos / maxMonthlyTotal) * 150;
+                  const hLab = (m.manoObra / maxMonthlyTotal) * 150;
 
                   const yRef = 185 - hRef;
                   const yIns = yRef - hIns;
@@ -338,7 +355,7 @@ export function MaintenanceDashboardView({
                         fontWeight={isActive ? 700 : 500}
                         fontFamily="ui-monospace, monospace"
                       >
-                        ${Math.round(m.totalMxn / 1000)}k
+                        {fm(m.total, { compact: true })}
                       </text>
                       <text
                         x={x + barWidth / 2}
@@ -388,7 +405,7 @@ export function MaintenanceDashboardView({
                 <div className="p-3 rounded-lg bg-[#0B1120] border border-slate-800 flex items-center justify-between">
                   <span className="text-slate-400">Total ejercido en el mes</span>
                   <span className="text-lg font-semibold font-mono tabular-nums text-emerald-400">
-                    ${activeMonth.totalMxn.toLocaleString('es-MX')} MXN
+                    {fm(activeMonth.total)} {curCode}
                   </span>
                 </div>
 
@@ -396,33 +413,33 @@ export function MaintenanceDashboardView({
                   {[
                     {
                       label: 'Refacciones',
-                      value: activeMonth.refaccionesMxn,
+                      value: activeMonth.refacciones,
                       barClass: 'bg-sky-500',
                       textClass: 'text-sky-300',
                     },
                     {
                       label: 'Insumos (aceites/lubricantes)',
-                      value: activeMonth.insumosMxn,
+                      value: activeMonth.insumos,
                       barClass: 'bg-emerald-500',
                       textClass: 'text-emerald-300',
                     },
                     {
                       label: 'Mano de obra y taller',
-                      value: activeMonth.manoObraMxn,
+                      value: activeMonth.manoObra,
                       barClass: 'bg-amber-500',
                       textClass: 'text-amber-300',
                     },
                   ].map((item) => {
                     const pct =
-                      activeMonth.totalMxn > 0
-                        ? Math.round((item.value / activeMonth.totalMxn) * 100)
+                      activeMonth.total > 0
+                        ? Math.round((item.value / activeMonth.total) * 100)
                         : 0;
                     return (
                       <div key={item.label} className="p-2.5 rounded-lg bg-[#0B1120] border border-slate-800/80 space-y-1.5">
                         <div className="flex items-center justify-between">
                           <span className="text-slate-300">{item.label}</span>
                           <span className={`font-mono tabular-nums font-semibold ${item.textClass}`}>
-                            ${item.value.toLocaleString('es-MX')} MXN ({pct}%)
+                            {fm(item.value)} ({pct}%)
                           </span>
                         </div>
                         <div className="h-1.5 w-full rounded-full bg-slate-800 overflow-hidden">
@@ -435,8 +452,8 @@ export function MaintenanceDashboardView({
               </div>
 
               <div className="pt-2 border-t border-slate-800 flex items-center justify-between text-[11px] text-slate-400 font-mono tabular-nums">
-                <span>Refacciones 6m: ${sixMonthTotals.refacciones.toLocaleString('es-MX')}</span>
-                <span>Insumos 6m: ${sixMonthTotals.insumos.toLocaleString('es-MX')}</span>
+                <span>Refacciones 6m: {fm(sixMonthTotals.refacciones)}</span>
+                <span>Insumos 6m: {fm(sixMonthTotals.insumos)}</span>
               </div>
             </>
           ) : (
@@ -633,8 +650,7 @@ export function MaintenanceDashboardView({
                         </div>
                         <div className="text-slate-300 truncate mt-0.5">{wo.title}</div>
                         <div className="text-slate-500 font-mono tabular-nums mt-0.5">
-                          {formatServiceDate(wo.scheduledDate)} · {wo.workshopOrTech} · $
-                          {wo.totalCostMxn.toLocaleString('es-MX')} MXN
+                          {formatServiceDate(wo.scheduledDate)} · {wo.workshopOrTech} · {money.fmt(wo.totalCost, wo.tenantId, { withCode: true })}
                         </div>
                       </div>
                       <button

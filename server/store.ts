@@ -2,6 +2,25 @@ import crypto from 'crypto';
 import { hashPassword, hashPasswordSync, hashToken, validatePasswordPolicy, verifyPassword } from './auth/password.ts';
 import { runMigrations } from './db/migrate.ts';
 import { StateRepository } from './db/stateRepository.ts';
+import { MAP_REGION } from '../src/shared/region.ts';
+import { buildDefaultAlertRules, buildDefaultPreventivePlans } from './tenants/templates.ts';
+import { CUIT_MESSAGES, cuitProblem, formatCuit, taxIdKey } from '../src/shared/cuit.ts';
+import { fileSlug } from './export/csv.ts';
+import type { ObdReading } from './ingest/obd.ts';
+import { describeDtc } from '../src/shared/dtc.ts';
+import { catalogModelLabel, findCatalogModel, GENERIC_JT808_DRIVER_ID } from '../src/shared/deviceCatalog.ts';
+import { composeBrandModel } from '../src/shared/vehicleCatalog.ts';
+import { DriverRegistry } from './drivers/registry.ts';
+import { CurrencyService } from './currency/service.ts';
+import { BASE_CURRENCIES, formatMoney } from '../src/shared/currency.ts';
+import {
+  newPhoneIdentifier,
+  PHONE_DEVICE_PRIORITY_MS,
+  PHONE_LOW_BATTERY_PCT,
+  PHONE_MAX_ACCURACY_M,
+  PHONE_OFFLINE_MINUTES,
+} from '../src/shared/phone.ts';
+import { computeDriverAuthorization, AUTH_STATE_LABELS } from '../src/shared/drivers.ts';
 import type {
   AlertEvent,
   AlertRule,
@@ -10,9 +29,20 @@ import type {
   ChecklistItem,
   DashcamDriverProfile,
   Device,
+  DeviceConnectionSettings,
   DeviceDashcamConfig,
+  DeviceUplink,
   Driver,
   FaultCode,
+  DriverPhoneTracker,
+  PhoneListItem,
+  PhonePlatform,
+  PhoneProvisioningStatus,
+  ObdCommandEntry,
+  ObdFaultEvent,
+  ObdHistoryPoint,
+  ObdHistoryRange,
+  ObdProvisioningStatus,
   FleetStoreState,
   Incident,
   MaintenanceDashboardMetrics,
@@ -27,10 +57,14 @@ import type {
   PreOpChecklistResult,
   PreventivePlan,
   ProtocolType,
+  UnitConnection,
   PublicUser,
   RoleDefinition,
   Tenant,
   TenantBootstrapResponse,
+  TenantStatus,
+  TenantSummary,
+  UnmatchedDevice,
   UserAccount,
   Vehicle,
   VideoClip,
@@ -134,14 +168,10 @@ const ROAD_HIGHWAY_IMG = '/src/assets/images/dashcam_road_highway_1795020102566.
 const ROAD_URBAN_IMG = '/src/assets/images/dashcam_road_urban_1795020103292.jpg';
 const CABIN_DRIVER_IMG = '/src/assets/images/dashcam_cabin_driver_1795020104262.jpg';
 
-const CORRIDORS = [
-  { city: 'Monterrey', branch: 'Monterrey Centro', lat: 25.6866, lng: -100.3161, geofence: 'Corredor Industrial Apodaca' },
-  { city: 'Saltillo', branch: 'Saltillo Hub', lat: 25.4232, lng: -100.9924, geofence: 'Parque Derramadero' },
-  { city: 'CDMX', branch: 'CDMX Poniente', lat: 19.4326, lng: -99.1332, geofence: 'Zona Logística Vallejo' },
-  { city: 'Guadalajara', branch: 'Guadalajara Sur', lat: 20.6597, lng: -103.3496, geofence: 'Periférico Sur Tlaquepaque' },
-  { city: 'Querétaro', branch: 'Querétaro Bajío', lat: 20.5888, lng: -100.3899, geofence: 'Parque Aeroespacial QRO' },
-  { city: 'León', branch: 'León Norte', lat: 21.1250, lng: -101.6860, geofence: 'Puerto Interior Silao' },
-];
+// Hubs come from the shared region config (src/shared/region.ts). Index order matters:
+// tenants use corridorIndices [0,1], [2,3] and [4,5].
+const CORRIDORS = MAP_REGION.hubs;
+const UNIT_SPREAD = MAP_REGION.unitSpreadDeg;
 
 const FIRST_NAMES = ['Carlos', 'Miguel', 'Lucía', 'Javier', 'Sofía', 'Fernando', 'Andrés', 'Valeria', 'Ricardo', 'Elena', 'Raúl', 'Patricia'];
 const LAST_NAMES = ['Mendoza', 'Herrera', 'Salazar', 'Castillo', 'Ríos', 'Vega', 'Navarro', 'Delgado', 'Cortés', 'Ortega', 'Aguilar', 'Paredes'];
@@ -276,6 +306,54 @@ const INITIAL_DASHCAM_DRIVERS: DashcamDriverProfile[] = [
     },
     notes: 'Integración MDVR vehicular robusta para maquinaria pesada y tractocamiones: 4 canales AHD 1080p, SSD antivibración y cámara BSD punto ciego.',
   },
+  {
+    id: 'drv-jimi-jc181',
+    vendorFamily: 'jimi_concox',
+    vendorName: 'Jimi IoT / Concox',
+    modelSeries: 'JC181 / JC261 / JC261P',
+    driverCode: 'JT808_2013_JT1078_JIMI',
+    driverVersion: 'JT808-2013 / JT1078-2016',
+    protocol: 'JT808/JT1078',
+    defaultPort: 5015,
+    maxChannels: 2,
+    supportedResolutions: ['1080p_30fps', '720p_30fps', '720p_15fps'],
+    defaultBitrateKbps: 1536,
+    supportedFeatures: {
+      adas: false,
+      dms: false,
+      bsd: false,
+      canJ1939: false,
+      rs232: false,
+      intercomAudio: true,
+      dualSdSsd: false,
+      gSensor: true,
+    },
+    notes: 'Probado con Traccar: servidor 1 JT/T 808 en 5015 y servidor 2 JT/T 1078 (video) en 5263. Frontal 1080p + cabina; la JC261 suma ADAS.',
+  },
+  {
+    id: GENERIC_JT808_DRIVER_ID,
+    vendorFamily: 'jt808_generico',
+    vendorName: 'JT/T 808 genérico',
+    modelSeries: 'Meitrack, MettaX y otros JT808/JT1078',
+    driverCode: 'JT808_JT1078_GENERIC',
+    driverVersion: 'JT808-2013/2019 / JT1078-2016',
+    protocol: 'JT808/JT1078',
+    defaultPort: 5015,
+    maxChannels: 4,
+    supportedResolutions: ['1080p_30fps', '720p_30fps', '720p_15fps'],
+    defaultBitrateKbps: 1536,
+    supportedFeatures: {
+      adas: false,
+      dms: false,
+      bsd: false,
+      canJ1939: false,
+      rs232: false,
+      intercomAudio: false,
+      dualSdSsd: false,
+      gSensor: true,
+    },
+    notes: 'Perfil base para equipos que hablan JT/T 808 + JT/T 1078 estándar sin driver propio. Activar ADAS/DMS solo si el equipo los tiene.',
+  },
 ];
 
 function matchDriverForModel(
@@ -284,6 +362,10 @@ function matchDriverForModel(
   driverPool: DashcamDriverProfile[]
 ): DashcamDriverProfile {
   const lower = model.toLowerCase();
+  const byId = (id: string) => driverPool.find((d) => d.id === id);
+  if (lower.includes('jc181') || lower.includes('jc261')) {
+    return byId('drv-jimi-jc181') ?? byId('drv-jimi-jc400') ?? driverPool[0];
+  }
   if (lower.includes('streamax')) {
     return driverPool.find((d) => d.id === 'drv-streamax-x3') ?? driverPool[0];
   }
@@ -296,16 +378,21 @@ function matchDriverForModel(
   if (lower.includes('hikvision') || lower.includes('dahua') || lower.includes('mdvr') || lower.includes('ds-mp')) {
     return driverPool.find((d) => d.id === 'drv-hik-dahua-mdvr') ?? driverPool[0];
   }
-  return driverPool.find((d) => d.id === 'drv-howen-me40') ?? driverPool[0];
+  if (lower.includes('howen') || lower.includes('hero-')) {
+    return byId('drv-howen-me40') ?? driverPool[0];
+  }
+  // Unknown model: a standard JT808 profile is safer than assuming a Howen MDVR.
+  return byId(GENERIC_JT808_DRIVER_ID) ?? byId('drv-howen-me40') ?? driverPool[0];
 }
 
 function buildDefaultDashcamConfig(
   model: string,
   protocol: ProtocolType,
   driverPool: DashcamDriverProfile[],
-  updatedBy = 'Sistema'
+  updatedBy = 'Sistema',
+  resolvedDriver?: DashcamDriverProfile
 ): DeviceDashcamConfig {
-  const drv = matchDriverForModel(model, protocol, driverPool);
+  const drv = resolvedDriver ?? matchDriverForModel(model, protocol, driverPool);
   const channels =
     drv.protocol === 'Traccar'
       ? ['CH1 Frontal (DualCam RS232)', 'Bus CAN J1939']
@@ -447,34 +534,40 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
       id: 'ten-norte',
       name: 'TransLogística Norte S.A.',
       taxId: 'TLN-980412-K81',
-      city: 'Monterrey, NL',
-      branches: ['Monterrey Centro', 'Saltillo Hub'],
+      city: 'San Juan Capital, San Juan',
+      branches: [CORRIDORS[0].branch, CORRIDORS[1].branch],
       vehicleQuota: 50,
       retentionDays: 30,
       planTier: 'Piloto Empresarial',
       status: 'piloto',
+      currency: 'ARS',
+      referenceCurrency: 'USD',
     },
     {
       id: 'ten-urbana',
       name: 'Mensajería Urbana Express',
       taxId: 'MUE-140922-M12',
-      city: 'Ciudad de México',
-      branches: ['CDMX Poniente', 'Guadalajara Sur'],
+      city: 'Rivadavia, San Juan',
+      branches: [CORRIDORS[2].branch, CORRIDORS[3].branch],
       vehicleQuota: 40,
       retentionDays: 15,
       planTier: 'Piloto Última Milla',
       status: 'piloto',
+      currency: 'ARS',
+      referenceCurrency: 'USD',
     },
     {
       id: 'ten-frio',
       name: 'FríoCadena Refrigerados',
       taxId: 'FCR-190305-Q44',
-      city: 'Querétaro, QRO',
-      branches: ['Querétaro Bajío', 'León Norte'],
+      city: 'Pocito, San Juan',
+      branches: [CORRIDORS[4].branch, CORRIDORS[5].branch],
       vehicleQuota: 25,
       retentionDays: 45,
       planTier: 'Piloto Cadena Fría',
       status: 'piloto',
+      currency: 'ARS',
+      referenceCurrency: 'USD',
     },
   ];
 
@@ -603,47 +696,7 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
   let globalIndex = 1;
 
   for (const tc of tenantCounts) {
-    preventivePlans.push(
-      {
-        id: `pln-${tc.tenantId}-veh-250`,
-        tenantId: tc.tenantId,
-        name: 'Servicio Preventivo A · Vehículos y Tractos (250 h / 10,000 km)',
-        assetType: 'vehiculo',
-        intervalHours: 250,
-        intervalKm: 10000,
-        intervalDays: 45,
-        estimatedCostMxn: 6850,
-        checklistFocus: 'Aceite motor 15W-40, filtros diésel/aire, ajuste de balatas y calibración ADAS.',
-        active: true,
-        updatedAt: iso(1440),
-      },
-      {
-        id: `pln-${tc.tenantId}-maq-250`,
-        tenantId: tc.tenantId,
-        name: 'Overhaul Preventivo 250 h · Maquinaria Pesada',
-        assetType: 'maquinaria_pesada',
-        intervalHours: 250,
-        intervalKm: 2500,
-        intervalDays: 30,
-        estimatedCostMxn: 14900,
-        checklistFocus: 'Aceite hidráulico ISO 46, mangueras alta presión, engrase de pernos y diagnóstico J1939.',
-        active: true,
-        updatedAt: iso(2880),
-      },
-      {
-        id: `pln-${tc.tenantId}-cam-90`,
-        tenantId: tc.tenantId,
-        name: 'Inspección Trimestral Dashcam, Arnés y Bus CAN',
-        assetType: 'ambos',
-        intervalHours: 500,
-        intervalKm: 20000,
-        intervalDays: 90,
-        estimatedCostMxn: 1950,
-        checklistFocus: 'Limpieza de lentes CH1/CH2, verificación SD industrial, calibración G-Sensor y puerto OBD/J1939.',
-        active: true,
-        updatedAt: iso(4320),
-      }
-    );
+    preventivePlans.push(...buildDefaultPreventivePlans(tc.tenantId, iso));
 
     partsInventory.push(
       {
@@ -655,7 +708,7 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
         unit: 'cubeta',
         stockQty: 14,
         minStock: 5,
-        unitCostMxn: 2650,
+        unitCost: 2650,
         warehouseLocation: 'Almacén A · Rack 01',
         updatedAt: iso(240),
       },
@@ -668,7 +721,7 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
         unit: 'cubeta',
         stockQty: 9,
         minStock: 4,
-        unitCostMxn: 2450,
+        unitCost: 2450,
         warehouseLocation: 'Almacén A · Rack 02',
         updatedAt: iso(360),
       },
@@ -681,7 +734,7 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
         unit: 'juego',
         stockQty: 8,
         minStock: 4,
-        unitCostMxn: 2890,
+        unitCost: 2890,
         warehouseLocation: 'Almacén B · Pasillo 03',
         updatedAt: iso(480),
       },
@@ -694,7 +747,7 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
         unit: 'kit',
         stockQty: 6,
         minStock: 3,
-        unitCostMxn: 4200,
+        unitCost: 4200,
         warehouseLocation: 'Almacén B · Pasillo 01',
         updatedAt: iso(510),
       },
@@ -707,7 +760,7 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
         unit: 'kit',
         stockQty: 2,
         minStock: 3,
-        unitCostMxn: 5600,
+        unitCost: 5600,
         warehouseLocation: 'Almacén B · Pasillo 02',
         updatedAt: iso(720),
       },
@@ -720,7 +773,7 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
         unit: 'kit',
         stockQty: 11,
         minStock: 4,
-        unitCostMxn: 2950,
+        unitCost: 2950,
         warehouseLocation: 'Almacén B · Pasillo 04',
         updatedAt: iso(840),
       },
@@ -733,7 +786,7 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
         unit: 'pza',
         stockQty: 1,
         minStock: 3,
-        unitCostMxn: 4850,
+        unitCost: 4850,
         warehouseLocation: 'Almacén Electrónica · Gaveta 02',
         updatedAt: iso(960),
       },
@@ -746,7 +799,7 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
         unit: 'garrafa',
         stockQty: 22,
         minStock: 8,
-        unitCostMxn: 680,
+        unitCost: 680,
         warehouseLocation: 'Almacén A · Zona Fluidos',
         updatedAt: iso(180),
       }
@@ -849,8 +902,8 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
         ignition,
         speedKmh,
         heading: Math.round(Math.abs(seededOffset(idx + 5, 360))),
-        lat: Number((corridor.lat + seededOffset(idx, 0.22)).toFixed(5)),
-        lng: Number((corridor.lng + seededOffset(idx + 31, 0.24)).toFixed(5)),
+        lat: Number((corridor.lat + seededOffset(idx, UNIT_SPREAD)).toFixed(5)),
+        lng: Number((corridor.lng + seededOffset(idx + 31, UNIT_SPREAD)).toFixed(5)),
         odometerKm,
         engineHours,
         nextServiceHours,
@@ -867,12 +920,17 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
         geofenceName: corridor.geofence,
       });
 
+      const seedImei = `86420105${String(1000000 + idx * 173).slice(0, 7)}`;
       devices.push({
         id: deviceId,
         tenantId: tc.tenantId,
         vehicleId,
         unitCode,
-        imei: `86420105${String(1000000 + idx * 173).slice(0, 7)}`,
+        terminalId: seedImei.slice(-12),
+        uplink: 'wifi_starlink',
+        wifiSsid: `Starlink-${unitCode}`,
+        telemetrySource: 'simulada',
+        imei: seedImei,
         iccid: `8952010099${String(10000000 + idx * 91).slice(0, 8)}`,
         simCarrier: idx % 2 === 0 ? 'Telcel M2M IoT' : 'AT&T Multi-Carrier',
         model: devModel,
@@ -905,7 +963,7 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
           odometerAtService: Math.max(0, odometerKm - 4500),
           nextServiceDate,
           workshopOrTech: 'Taller Central Certificado',
-          costMxn: isHeavyMachinery ? 14800 : 6400,
+          cost: isHeavyMachinery ? 14800 : 6400,
           notes: 'Sin fugas hidráulicas ni desgaste prematuro en balatas.',
           status: 'completado',
         });
@@ -929,8 +987,8 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
                 name: 'Cubeta Aceite Hidráulico ISO 46 (19L)',
                 category: 'insumo',
                 quantity: 2,
-                unitCostMxn: 2450,
-                subtotalMxn: 4900,
+                unitCost: 2450,
+                subtotal: 4900,
               },
               {
                 id: `prt-${idx}-2`,
@@ -938,8 +996,8 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
                 name: 'Kit Filtros Hidráulico y Retorno CAT 320',
                 category: 'refaccion',
                 quantity: 1,
-                unitCostMxn: 4200,
-                subtotalMxn: 4200,
+                unitCost: 4200,
+                subtotal: 4200,
               },
             ]
           : [
@@ -949,8 +1007,8 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
                 name: 'Aceite Diésel Sintético 15W-40 CK-4 (19L)',
                 category: 'insumo',
                 quantity: 1,
-                unitCostMxn: 2650,
-                subtotalMxn: 2650,
+                unitCost: 2650,
+                subtotal: 2650,
               },
               {
                 id: `prt-${idx}-2`,
@@ -958,12 +1016,12 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
                 name: 'Juego de Balatas Delanteras Heavy Duty',
                 category: 'refaccion',
                 quantity: 1,
-                unitCostMxn: 2890,
-                subtotalMxn: 2890,
+                unitCost: 2890,
+                subtotal: 2890,
               },
             ];
-        const partsCostMxn = parts.reduce((acc, p) => acc + p.subtotalMxn, 0);
-        const laborCostMxn = isHeavyMachinery ? 3600 : 1950;
+        const partsCost = parts.reduce((acc, p) => acc + p.subtotal, 0);
+        const laborCost = isHeavyMachinery ? 3600 : 1950;
         const scheduledDate = computeServiceDateFromHours(engineHours, engineHours + (i - 2) * 8);
         workOrders.push({
           id: `OT-${tc.prefix}-${100 + i}`,
@@ -988,9 +1046,9 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
           engineHoursAtOrder: engineHours,
           odometerAtOrder: odometerKm,
           parts,
-          laborCostMxn,
-          partsCostMxn,
-          totalCostMxn: partsCostMxn + laborCostMxn,
+          laborCost,
+          partsCost,
+          totalCost: partsCost + laborCost,
           notes:
             status === 'esperando_refacciones'
               ? 'En espera de sello hidráulico y válvula de alivio de almacén regional.'
@@ -1016,8 +1074,8 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
                 name: 'Aceite Hidráulico ISO 46 + Sellos',
                 category: 'insumo',
                 quantity: 1 + (monthsBack % 2),
-                unitCostMxn: 2350,
-                subtotalMxn: (1 + (monthsBack % 2)) * 2350,
+                unitCost: 2350,
+                subtotal: (1 + (monthsBack % 2)) * 2350,
               },
               {
                 id: `prt-h-${idx}-2`,
@@ -1025,8 +1083,8 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
                 name: 'Kit Bombas / Mangueras Alta Presión',
                 category: 'refaccion',
                 quantity: 1,
-                unitCostMxn: 5200 + monthsBack * 350,
-                subtotalMxn: 5200 + monthsBack * 350,
+                unitCost: 5200 + monthsBack * 350,
+                subtotal: 5200 + monthsBack * 350,
               },
             ]
           : [
@@ -1036,8 +1094,8 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
                 name: 'Lubricante Sintético + Anticongelante',
                 category: 'insumo',
                 quantity: 1,
-                unitCostMxn: 2250 + (i % 3) * 200,
-                subtotalMxn: 2250 + (i % 3) * 200,
+                unitCost: 2250 + (i % 3) * 200,
+                subtotal: 2250 + (i % 3) * 200,
               },
               {
                 id: `prt-h-${idx}-2`,
@@ -1045,12 +1103,12 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
                 name: 'Juego Balatas, Filtros y Tensores',
                 category: 'refaccion',
                 quantity: 1 + (i % 2),
-                unitCostMxn: 2650 + monthsBack * 180,
-                subtotalMxn: (1 + (i % 2)) * (2650 + monthsBack * 180),
+                unitCost: 2650 + monthsBack * 180,
+                subtotal: (1 + (i % 2)) * (2650 + monthsBack * 180),
               },
             ];
-        const partsCostMxn = histParts.reduce((s, p) => s + p.subtotalMxn, 0);
-        const laborCostMxn = isHeavyMachinery ? 3400 + monthsBack * 150 : 1850 + monthsBack * 120;
+        const partsCost = histParts.reduce((s, p) => s + p.subtotal, 0);
+        const laborCost = isHeavyMachinery ? 3400 + monthsBack * 150 : 1850 + monthsBack * 120;
         workOrders.push({
           id: `OT-${tc.prefix}-H${monthsBack}${String(i).padStart(2, '0')}`,
           tenantId: tc.tenantId,
@@ -1071,9 +1129,9 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
           engineHoursAtOrder: Math.max(120, Number((engineHours - monthsBack * 190).toFixed(1))),
           odometerAtOrder: Math.max(800, odometerKm - monthsBack * 3200),
           parts: histParts,
-          laborCostMxn,
-          partsCostMxn,
-          totalCostMxn: partsCostMxn + laborCostMxn,
+          laborCost,
+          partsCost,
+          totalCost: partsCost + laborCost,
           notes: 'Servicio cerrado en historial mensual de taller.',
           clearFaultsOnClose: true,
           createdAt: histIso,
@@ -1360,7 +1418,7 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
       speedKmh: 46,
       timestamp: iso(95),
       clipId: null,
-      summary: 'Desvío de ruta de reparto 410 m al norte del polígono Vallejo.',
+      summary: 'Desvío de ruta de reparto 410 m al norte del polígono Acceso Norte Chimbas.',
     },
   ];
 
@@ -1413,7 +1471,7 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
       assignee: 'Carlos Ortega',
       createdAt: iso(180),
       updatedAt: iso(140),
-      resolutionNote: 'Programada revisión de arnés y actualización de firmware FW 4.2.18-JT1078 en patio Vallejo.',
+      resolutionNote: 'Programada revisión de arnés y actualización de firmware FW 4.2.18-JT1078 en patio Chimbas.',
       clipId: null,
     },
   ];
@@ -1475,8 +1533,8 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
             name: 'Cubeta Aceite Hidráulico ISO 46 (19L)',
             category: 'insumo',
             quantity: 1,
-            unitCostMxn: 2450,
-            subtotalMxn: 2450,
+            unitCost: 2450,
+            subtotal: 2450,
           },
           {
             id: `prt-auto-${v.id}-2`,
@@ -1484,8 +1542,8 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
             name: 'Kit Filtros Hidráulico y Retorno CAT 320',
             category: 'refaccion',
             quantity: 1,
-            unitCostMxn: 4200,
-            subtotalMxn: 4200,
+            unitCost: 4200,
+            subtotal: 4200,
           },
         ]
       : [
@@ -1495,8 +1553,8 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
             name: 'Aceite Diésel Sintético 15W-40 CK-4 (19L)',
             category: 'insumo',
             quantity: 1,
-            unitCostMxn: 2650,
-            subtotalMxn: 2650,
+            unitCost: 2650,
+            subtotal: 2650,
           },
           {
             id: `prt-auto-${v.id}-2`,
@@ -1504,12 +1562,12 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
             name: 'Juego de Balatas Delanteras Heavy Duty',
             category: 'refaccion',
             quantity: 1,
-            unitCostMxn: 2890,
-            subtotalMxn: 2890,
+            unitCost: 2890,
+            subtotal: 2890,
           },
         ];
-    const partsCostMxn = defaultParts.reduce((s, p) => s + p.subtotalMxn, 0);
-    const laborCostMxn = isMach ? 3600 : 1950;
+    const partsCost = defaultParts.reduce((s, p) => s + p.subtotal, 0);
+    const laborCost = isMach ? 3600 : 1950;
     workOrders.push({
       id: `OT-${v.unitCode.split('-')[0]}-A${v.id.slice(-3)}`,
       tenantId: v.tenantId,
@@ -1527,9 +1585,9 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
       engineHoursAtOrder: v.engineHours,
       odometerAtOrder: v.odometerKm,
       parts: defaultParts,
-      laborCostMxn,
-      partsCostMxn,
-      totalCostMxn: partsCostMxn + laborCostMxn,
+      laborCost,
+      partsCost,
+      totalCost: partsCost + laborCost,
       notes: `Generada automáticamente por umbral ${v.maintenanceStatus} (${v.engineHours} h / ${v.odometerKm} km).`,
       clearFaultsOnClose: true,
       autoGenerated: true,
@@ -1558,6 +1616,14 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
     videoClips,
     roles,
     auditLogs,
+    currencies: BASE_CURRENCIES.map((c) => ({ ...c, updatedAt: iso(0) })),
+    // Demo rates only (seeded data): the real ones are loaded by the superadmin.
+    exchangeRates: [
+      { id: 'fx-demo-ars', currency: 'ARS', perUsd: 1450, effectiveAt: '2026-01-01T00:00:00.000Z', source: 'demo', createdBy: 'Datos demo', createdAt: '2026-01-01T00:00:00.000Z', tenantId: null },
+      { id: 'fx-demo-ves', currency: 'VES', perUsd: 240, effectiveAt: '2026-01-01T00:00:00.000Z', source: 'demo', createdBy: 'Datos demo', createdAt: '2026-01-01T00:00:00.000Z', tenantId: null },
+      { id: 'fx-demo-clp', currency: 'CLP', perUsd: 950, effectiveAt: '2026-01-01T00:00:00.000Z', source: 'demo', createdBy: 'Datos demo', createdAt: '2026-01-01T00:00:00.000Z', tenantId: null },
+    ],
+    currencyChanges: [],
     sizing: {
       vehiclesCount: 96,
       gpsIntervalSec: 15,
@@ -1606,6 +1672,23 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
   };
 }
 
+/** Traccar alarm codes → alert label, priority and matching rule condition. */
+const TRACCAR_ALARMS: Record<
+  string,
+  { label: string; priority: AlertEvent['priority']; condition: AlertRule['conditionType'] | null }
+> = {
+  sos: { label: 'Botón de pánico (SOS)', priority: 'critica', condition: 'panico' },
+  accident: { label: 'Posible colisión', priority: 'critica', condition: 'colision_g' },
+  tampering: { label: 'Manipulación del equipo', priority: 'critica', condition: 'desconexion_cam' },
+  overspeed: { label: 'Exceso de velocidad', priority: 'alta', condition: 'velocidad' },
+  fatigueDriving: { label: 'Fatiga de conducción', priority: 'alta', condition: 'fatiga_dms' },
+  driverDistraction: { label: 'Distracción del conductor', priority: 'alta', condition: 'fatiga_dms' },
+  geofenceEnter: { label: 'Entrada a geocerca', priority: 'media', condition: 'geocerca' },
+  geofenceExit: { label: 'Salida de geocerca', priority: 'media', condition: 'geocerca' },
+  powerCut: { label: 'Corte de alimentación', priority: 'alta', condition: null },
+  lowBattery: { label: 'Batería baja', priority: 'media', condition: null },
+};
+
 export interface ActiveSession {
   /** sha256 of the bearer token; the raw token is never stored. */
   tokenHash: string;
@@ -1630,8 +1713,21 @@ const LOCKOUT_MS = 15 * 60_000;
 const DUMMY_PASSWORD_HASH = hashPasswordSync(crypto.randomBytes(12).toString('hex'));
 
 /** Business-rule violation that should reach the client as HTTP 400. */
+/** Camera addresses set by the superadmin (videoHost only when the video tunnel has another host). */
+export interface CameraServerOverride {
+  host: string;
+  jt808Port: number;
+  videoHost?: string;
+  jt1078Port: number;
+}
+
 export class DomainError extends Error {
-  readonly status = 400;
+  constructor(
+    message: string,
+    readonly status = 400
+  ) {
+    super(message);
+  }
 }
 
 /** Audit entries about global settings (visible only to the superadmin). */
@@ -1649,6 +1745,27 @@ class FleetStore {
   private repo = new StateRepository();
   private pendingWrite: Promise<void> = Promise.resolve();
   private initialized = false;
+  private persistTimer: NodeJS.Timeout | null = null;
+  /** Devices reported by Traccar that match no registered device (onboarding aid, in memory). */
+  private unmatchedDevices = new Map<string, UnmatchedDevice>();
+  /** Driver registry (documents, authorization, assignment). Shares this store's state and persistence. */
+  readonly driverRegistry = new DriverRegistry(() => ({
+    state: this.state,
+    repo: this.repo,
+    audit: (entry) => {
+      this.addAuditLog(entry);
+    },
+    persist: () => this.persist(this.state),
+  }));
+  /** Currencies, exchange rates and company currency (superadmin). */
+  readonly currency = new CurrencyService(() => ({
+    state: this.state,
+    repo: this.repo,
+    audit: (entry) => {
+      this.addAuditLog(entry);
+    },
+    persist: () => this.persist(this.state),
+  }));
 
   async init(): Promise<void> {
     if (this.initialized) return;
@@ -1661,9 +1778,22 @@ class FleetStore {
       this.persist(this.state);
       await this.flush();
     }
+    const devicesChanged = this.normalizeDevices();
+    const driversChanged = this.normalizeDrivers();
+    const legacyDriversChanged = this.driverRegistry.normalizeLegacy();
+    const verificationChanged = this.driverRegistry.normalizeVerification();
+    const currencyChanged = this.currency.normalize();
+    if (devicesChanged || driversChanged || legacyDriversChanged || verificationChanged || currencyChanged) {
+      this.persist(this.state);
+      await this.flush();
+    }
     for (const s of await this.repo.loadActiveSessions()) {
       this.sessions.set(s.tokenHash, s);
     }
+    this.phoneServerUrlOverride = (await this.repo.getAppSetting<{ url: string }>('phone_server_url'))?.url ?? null;
+    this.obdServerOverride = await this.repo.getAppSetting<{ host: string; port: number }>('obd_server');
+    this.cameraServerOverride = await this.repo.getAppSetting<CameraServerOverride>('camera_server');
+    await this.currency.load();
     this.initialized = true;
   }
 
@@ -1720,6 +1850,8 @@ class FleetStore {
       incidents: [],
       videoClips: [],
       auditLogs: [],
+      exchangeRates: [],
+      currencyChanges: [],
     };
   }
 
@@ -1733,6 +1865,1049 @@ class FleetStore {
   /** Resolves once every queued write is committed; rejects if the latest write failed. */
   async flush(): Promise<void> {
     await this.pendingWrite;
+  }
+
+  /** Writes anything still waiting in the persistSoon() debounce. Call before the process exits. */
+  async shutdown(): Promise<void> {
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+      this.persist(this.state);
+    }
+    await this.flush();
+  }
+
+  /** Coalesces frequent writes (e.g. one per incoming GPS position) into one save every 2 s. */
+  private persistSoon(): void {
+    if (this.persistTimer) return;
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
+      this.persist(this.state);
+    }, 2000);
+    this.persistTimer.unref?.();
+  }
+
+  /** Fills connection fields on devices saved before they existed. Returns true if anything changed. */
+  /** Adds built-in driver profiles introduced after the database was created (by id; existing ones are left as edited). */
+  private normalizeDrivers(): boolean {
+    const known = new Set(this.state.dashcamDrivers.map((d) => d.id));
+    const missing = INITIAL_DASHCAM_DRIVERS.filter((d) => !known.has(d.id));
+    for (const d of missing) this.state.dashcamDrivers.push(structuredClone(d));
+    return missing.length > 0;
+  }
+
+  private normalizeDevices(): boolean {
+    let changed = false;
+    const used = new Set<string>();
+    for (const d of this.state.devices) {
+      if (!d.terminalId) {
+        let candidate = d.imei.slice(-12);
+        if (used.has(candidate)) candidate = d.imei;
+        d.terminalId = candidate;
+        changed = true;
+      }
+      used.add(d.terminalId);
+      if (!d.uplink) {
+        d.uplink = 'wifi_starlink';
+        changed = true;
+      }
+      if (!d.telemetrySource) {
+        d.telemetrySource = 'simulada';
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  /** Server URL for Traccar Client set by the superadmin (e.g. a tunnel); null = derived from DEVICE_SERVER_HOST. */
+  private phoneServerUrlOverride: string | null = null;
+  /** Host/port for OBD-II trackers set by the superadmin (TCP tunnel); null = DEVICE_SERVER_HOST + teltonikaPort. */
+  private obdServerOverride: { host: string; port: number } | null = null;
+  /** Addresses programmed into the cameras set by the superadmin; null = DEVICE_SERVER_HOST + JT808/JT1078 ports. */
+  private cameraServerOverride: CameraServerOverride | null = null;
+
+  getDeviceConnectionSettings(): DeviceConnectionSettings {
+    const host = process.env.DEVICE_SERVER_HOST?.trim() || null;
+    const osmandPort = Number(process.env.DEVICE_OSMAND_PORT || 5055);
+    const teltonikaPort = Number(process.env.DEVICE_TELTONIKA_PORT || 5027);
+    const jt808Port = Number(process.env.DEVICE_JT808_PORT || 5015);
+    const jt1078Port = Number(process.env.DEVICE_JT1078_PORT || 5263);
+    const cam = this.cameraServerOverride;
+    return {
+      host,
+      jt808Port,
+      jt1078Port,
+      teltonikaPort,
+      cameraHost: cam?.host ?? host,
+      cameraJt808Port: cam?.jt808Port ?? jt808Port,
+      cameraVideoHost: cam?.videoHost ?? cam?.host ?? host,
+      cameraJt1078Port: cam?.jt1078Port ?? jt1078Port,
+      cameraServerCustom: cam !== null,
+      osmandPort,
+      obdHost: this.obdServerOverride?.host ?? host,
+      obdPort: this.obdServerOverride?.port ?? teltonikaPort,
+      obdServerCustom: this.obdServerOverride !== null,
+      phoneServerUrl: this.phoneServerUrlOverride ?? `http://${host ?? '<dominio-del-VPS>'}:${osmandPort}`,
+      phoneServerUrlCustom: this.phoneServerUrlOverride !== null,
+      ingestEnabled: Boolean(process.env.INGEST_TOKEN),
+    };
+  }
+
+  /** Sets (or with null restores) the addresses programmed into the cameras. Global, like the OBD server. */
+  async setCameraServer(value: CameraServerOverride | null, actorName: string, actorRole: string): Promise<DeviceConnectionSettings> {
+    const fmt = (dc: DeviceConnectionSettings) =>
+      `JT808 ${dc.cameraHost ?? '(sin host)'}:${dc.cameraJt808Port} · JT1078 ${dc.cameraVideoHost ?? '(sin host)'}:${dc.cameraJt1078Port}`;
+    const before = fmt(this.getDeviceConnectionSettings());
+    const clean = value ? { ...value, videoHost: value.videoHost && value.videoHost !== value.host ? value.videoHost : undefined } : null;
+    await this.repo.setAppSetting('camera_server', clean);
+    this.cameraServerOverride = clean;
+    const after = fmt(this.getDeviceConnectionSettings());
+    this.addAuditLog({
+      tenantId: GLOBAL_AUDIT_TENANT,
+      actorName,
+      actorRole,
+      actorHidden: true,
+      module: 'Configuración de Cámaras',
+      action: value === null ? 'Servidor de cámaras restaurado' : 'Servidor de cámaras modificado',
+      targetLabel: 'Cámaras JT/T 808 / 1078',
+      detail: `Antes: ${before}. Ahora: ${after}. Las cámaras ya programadas siguen usando el servidor que tienen: hay que reprogramarlas.`,
+    });
+    this.persist(this.state);
+    return this.getDeviceConnectionSettings();
+  }
+
+  /** Sets (or with null restores) the host/port programmed into OBD-II trackers. Global, like the phone URL. */
+  async setObdServer(value: { host: string; port: number } | null, actorName: string, actorRole: string): Promise<DeviceConnectionSettings> {
+    const fmt = (dc: DeviceConnectionSettings) => `${dc.obdHost ?? '(sin host)'}:${dc.obdPort}`;
+    const before = fmt(this.getDeviceConnectionSettings());
+    await this.repo.setAppSetting('obd_server', value);
+    this.obdServerOverride = value;
+    const after = fmt(this.getDeviceConnectionSettings());
+    this.addAuditLog({
+      tenantId: GLOBAL_AUDIT_TENANT,
+      actorName,
+      actorRole,
+      actorHidden: true,
+      module: 'Telemetría OBD-II',
+      action: value === null ? 'Servidor OBD-II restaurado' : 'Servidor OBD-II modificado',
+      targetLabel: 'Equipos Teltonika',
+      detail: `Antes: ${before}. Ahora: ${after}. Los equipos ya programados siguen usando el servidor que tienen: hay que reenviarles el SMS.`,
+    });
+    this.persist(this.state);
+    return this.getDeviceConnectionSettings();
+  }
+
+  /** Sets (or with null restores) the Server URL shown to drivers for Traccar Client. Global: one Traccar for every company. */
+  async setPhoneServerUrl(url: string | null, actorName: string, actorRole: string): Promise<DeviceConnectionSettings> {
+    const before = this.getDeviceConnectionSettings().phoneServerUrl;
+    await this.repo.setAppSetting('phone_server_url', url === null ? null : { url });
+    this.phoneServerUrlOverride = url;
+    const after = this.getDeviceConnectionSettings().phoneServerUrl;
+    this.addAuditLog({
+      tenantId: GLOBAL_AUDIT_TENANT,
+      actorName,
+      actorRole,
+      actorHidden: true,
+      module: 'Conexión Smartphone',
+      action: url === null ? 'URL de celulares restaurada' : 'URL de celulares modificada',
+      targetLabel: 'Traccar Client',
+      detail: `Antes: ${before}. Ahora: ${after}. Los celulares ya configurados siguen usando la URL que tienen cargada.`,
+    });
+    this.persist(this.state);
+    return this.getDeviceConnectionSettings();
+  }
+
+  updateDeviceConnection(
+    tenantId: string,
+    deviceId: string,
+    patch: { terminalId: string; uplink: DeviceUplink; wifiSsid?: string },
+    actorName: string,
+    actorRole: string,
+    allowAllTenants = false,
+    actorHidden = false
+  ): Device | null {
+    const dev = this.state.devices.find((d) => d.id === deviceId && (allowAllTenants || d.tenantId === tenantId));
+    if (!dev) return null;
+    const clash = this.state.devices.find((d) => d.id !== dev.id && d.terminalId === patch.terminalId);
+    if (clash) {
+      // Traccar identifies devices by this ID, so it must be unique across all companies.
+      throw new DomainError('Ese ID de terminal ya está asignado a otro equipo.');
+    }
+    const before = `${dev.terminalId} · ${dev.uplink} · ${dev.wifiSsid ?? '-'}`;
+    dev.terminalId = patch.terminalId;
+    dev.uplink = patch.uplink;
+    dev.wifiSsid = patch.wifiSsid || undefined;
+    this.unmatchedDevices.delete(patch.terminalId);
+    this.addAuditLog({
+      tenantId: dev.tenantId,
+      actorName,
+      actorRole,
+      actorHidden,
+      module: 'Configuración de Cámaras',
+      action: 'Conexión del equipo',
+      targetLabel: dev.unitCode,
+      detail: `Antes: ${before}. Ahora: ${dev.terminalId} · ${dev.uplink} · ${dev.wifiSsid ?? '-'}.`,
+    });
+    this.persist(this.state);
+    return dev;
+  }
+
+  // ---- Traccar ingest --------------------------------------------------------
+
+  private findDeviceByUniqueId(uniqueId: string): Device | undefined {
+    return (
+      this.state.devices.find((d) => d.terminalId === uniqueId) ?? this.state.devices.find((d) => d.imei === uniqueId)
+    );
+  }
+
+  private rememberUnmatched(uniqueId: string, name: string | undefined, at: string, lat?: number, lng?: number) {
+    this.unmatchedDevices.set(uniqueId, { uniqueId, name, lastSeenAt: at, lat, lng });
+    if (this.unmatchedDevices.size > 50) {
+      const oldest = [...this.unmatchedDevices.values()].sort((a, b) => a.lastSeenAt.localeCompare(b.lastSeenAt))[0];
+      this.unmatchedDevices.delete(oldest.uniqueId);
+    }
+  }
+
+  /** Applies a position forwarded by Traccar. Returns whether it matched a registered device. */
+  ingestTraccarPosition(input: {
+    uniqueId: string;
+    deviceName?: string;
+    positionId?: number;
+    latitude: number;
+    longitude: number;
+    speedKnots?: number;
+    course?: number;
+    fixTime: string;
+    serverTime?: string;
+    odometerMeters?: number;
+    ignition?: boolean;
+    /** Engine data (OBD-II trackers); applied only for devices with role 'telemetria'. */
+    obd?: ObdReading | null;
+    /** Smartphone extras (Traccar Client): fix accuracy, battery and charging state. */
+    accuracyM?: number;
+    batteryPct?: number;
+    charging?: boolean;
+  }): { matched: boolean; vehicleId?: string; stale?: boolean; phone?: boolean } {
+    const seenAt = input.serverTime ?? new Date().toISOString();
+    const dev = this.findDeviceByUniqueId(input.uniqueId);
+    if (!dev) {
+      const driver = this.findPhoneDriver(input.uniqueId);
+      if (driver) return this.ingestPhonePosition(driver, input, seenAt);
+      this.rememberUnmatched(input.uniqueId, input.deviceName, seenAt, input.latitude, input.longitude);
+      return { matched: false };
+    }
+    const v = this.state.vehicles.find((x) => x.id === dev.vehicleId);
+
+    // Traccar forwards concurrently and cameras replay buffered positions (0x0704) when coverage
+    // returns, so positions can arrive out of order. Never move a unit back to an older position.
+    let stale = false;
+    if (v && dev.telemetrySource === 'traccar') {
+      const fix = Date.parse(input.fixTime);
+      const last = Date.parse(v.lastReportAt);
+      if (Number.isFinite(fix) && Number.isFinite(last)) {
+        stale =
+          fix < last ||
+          (fix === last &&
+            input.positionId != null &&
+            input.positionId > 0 &&
+            dev.lastTraccarPositionId != null &&
+            input.positionId <= dev.lastTraccarPositionId);
+      }
+    }
+
+    dev.linkStatus = 'conectado';
+    dev.lastHeartbeatAt = seenAt;
+    dev.telemetrySource = 'traccar';
+    if (stale) {
+      this.persistSoon();
+      return { matched: true, vehicleId: v?.id, stale: true };
+    }
+    // Traccar 6.17 forwards before saving, so the id is usually 0; only real ids help ordering.
+    if (input.positionId != null && input.positionId > 0) dev.lastTraccarPositionId = input.positionId;
+    if (v) {
+      const speedKmh = Math.round((input.speedKnots ?? 0) * 1.852 * 10) / 10;
+      v.lat = Number(input.latitude.toFixed(6));
+      v.lng = Number(input.longitude.toFixed(6));
+      v.speedKmh = speedKmh;
+      if (typeof input.course === 'number') v.heading = Math.round(input.course) % 360;
+      if (typeof input.ignition === 'boolean') v.ignition = input.ignition;
+      if (typeof input.odometerMeters === 'number' && input.odometerMeters > 0) {
+        v.odometerKm = Number((input.odometerMeters / 1000).toFixed(1));
+      }
+      if (v.operationalStatus !== 'alerta') {
+        v.operationalStatus = speedKmh > 3 ? 'en_ruta' : 'detenido';
+      }
+      v.lastReportAt = input.fixTime;
+      v.positionSource = 'equipo';
+      v.positionSourceLabel = undefined;
+      if (dev.role === 'telemetria' && input.obd) this.applyObdReading(v, dev, input.obd, input.fixTime);
+    }
+    this.persistSoon();
+    return { matched: true, vehicleId: v?.id };
+  }
+
+  // ---- Driver smartphones (Traccar Client, OsmAnd protocol) -----------------
+
+  private static readonly PHONE_ACTOR = { name: 'Celular del chofer', role: 'Sistema' };
+
+  /**
+   * Last raw position of each phone (even an imprecise one), in memory only. Used to place an SOS
+   * when the phone has no accepted fix yet.
+   */
+  private lastPhoneRaw = new Map<string, { lat: number; lng: number; at: number; speedKmh: number }>();
+
+  private findPhoneDriver(uniqueId: string): Driver | undefined {
+    return this.state.drivers.find((d) => d.phoneTracker?.identifier === uniqueId);
+  }
+
+  private assignedVehicleOf(d: Driver): Vehicle | undefined {
+    return this.state.vehicles.find((v) => v.driverId === d.id && v.tenantId === d.tenantId);
+  }
+
+  /** True when the unit's own camera / OBD tracker reported through Traccar recently: it wins over the phone. */
+  private unitHasLiveDevice(v: Vehicle, now: number): boolean {
+    return this.state.devices.some(
+      (d) =>
+        d.vehicleId === v.id &&
+        d.telemetrySource === 'traccar' &&
+        now - Date.parse(d.lastHeartbeatAt) < PHONE_DEVICE_PRIORITY_MS
+    );
+  }
+
+  private phoneAlert(
+    d: Driver,
+    v: Vehicle | undefined,
+    ruleName: string,
+    priority: AlertEvent['priority'],
+    summary: string,
+    at: string,
+    ruleId = 'smartphone',
+    where?: { lat: number; lng: number; speedKmh?: number }
+  ) {
+    const fix = where ?? d.phoneTracker?.lastFix;
+    const alert: AlertEvent = {
+      id: `alr-${uid()}`,
+      tenantId: d.tenantId,
+      vehicleId: v?.id ?? '',
+      unitCode: v?.unitCode ?? 'Sin unidad',
+      plate: v?.plate ?? '',
+      driverName: d.name,
+      ruleId,
+      ruleName,
+      priority,
+      status: 'pendiente',
+      lat: v?.lat ?? fix?.lat ?? 0,
+      lng: v?.lng ?? fix?.lng ?? 0,
+      speedKmh: v?.speedKmh ?? fix?.speedKmh ?? 0,
+      timestamp: at,
+      clipId: null,
+      summary,
+    };
+    this.state.alerts.unshift(alert);
+    return alert;
+  }
+
+  /**
+   * Position from a driver's phone. Coordinates are kept only while the driver has a unit assigned
+   * (privacy); the unit moves only if its own tracker is silent.
+   */
+  private ingestPhonePosition(
+    d: Driver,
+    input: {
+      latitude: number;
+      longitude: number;
+      speedKnots?: number;
+      course?: number;
+      fixTime: string;
+      accuracyM?: number;
+      batteryPct?: number;
+      charging?: boolean;
+    },
+    seenAt: string
+  ): { matched: boolean; vehicleId?: string; stale?: boolean; phone: true } {
+    const t = d.phoneTracker!;
+    t.lastSeenAt = seenAt;
+    this.lastPhoneRaw.set(d.id, {
+      lat: Number(input.latitude.toFixed(6)),
+      lng: Number(input.longitude.toFixed(6)),
+      at: Date.now(),
+      speedKmh: Math.round((input.speedKnots ?? 0) * 1.852 * 10) / 10,
+    });
+    if (typeof input.batteryPct === 'number') t.batteryPct = Math.round(input.batteryPct);
+    if (typeof input.charging === 'boolean') t.charging = input.charging;
+    if (t.provisioning?.status !== 'conectado') {
+      t.provisioning = { status: 'conectado', at: seenAt, firstReportAt: seenAt };
+      this.addAuditLog({
+        tenantId: d.tenantId,
+        actorName: FleetStore.PHONE_ACTOR.name,
+        actorRole: FleetStore.PHONE_ACTOR.role,
+        module: 'Conexión Smartphone',
+        action: 'Celular conectado',
+        targetLabel: d.name,
+        detail: `Primer reporte del celular ${t.identifier} (Traccar Client).`,
+      });
+    }
+    const v = this.assignedVehicleOf(d);
+    const fixMs = Date.parse(input.fixTime);
+    const tooVague = typeof input.accuracyM === 'number' && input.accuracyM > PHONE_MAX_ACCURACY_M;
+    const older = t.lastFix && Number.isFinite(fixMs) && fixMs <= Date.parse(t.lastFix.at);
+    const speedKmh = Math.round((input.speedKnots ?? 0) * 1.852 * 10) / 10;
+    const accepted = !tooVague && !older && Number.isFinite(fixMs);
+    if (accepted) {
+      // The phone's last position is always kept on the driver; a unit moves only if one is assigned.
+      t.lastFix = {
+        lat: Number(input.latitude.toFixed(6)),
+        lng: Number(input.longitude.toFixed(6)),
+        at: input.fixTime,
+        speedKmh,
+        accuracyM: typeof input.accuracyM === 'number' ? Math.round(input.accuracyM) : undefined,
+        vehicleId: v?.id,
+      };
+      t.offlineAlertFor = undefined;
+    }
+    if (!v) {
+      this.persistSoon();
+      return { matched: true, stale: !accepted || undefined, phone: true };
+    }
+
+    // Low battery: one alert per assignment while it stays low.
+    if (typeof t.batteryPct === 'number' && t.batteryPct < PHONE_LOW_BATTERY_PCT && !t.charging) {
+      if (t.lowBatteryAlertFor !== v.id) {
+        t.lowBatteryAlertFor = v.id;
+        this.phoneAlert(
+          d,
+          v,
+          'Batería baja del celular del chofer',
+          'media',
+          `El celular de ${d.name} tiene ${t.batteryPct} % de batería: puede dejar de reportar la posición de ${v.unitCode}.`,
+          seenAt
+        );
+      }
+    } else if (typeof t.batteryPct === 'number' && (t.batteryPct >= PHONE_LOW_BATTERY_PCT + 5 || t.charging)) {
+      t.lowBatteryAlertFor = undefined;
+    }
+
+    if (!accepted || !t.lastFix) {
+      this.persistSoon();
+      return { matched: true, vehicleId: v.id, stale: true, phone: true };
+    }
+
+    const lastUnit = Date.parse(v.lastReportAt);
+    if (!this.unitHasLiveDevice(v, Date.now()) && !(Number.isFinite(lastUnit) && v.positionSource !== 'smartphone' && fixMs < lastUnit)) {
+      v.lat = t.lastFix.lat;
+      v.lng = t.lastFix.lng;
+      v.speedKmh = speedKmh;
+      if (typeof input.course === 'number' && input.course >= 0) v.heading = Math.round(input.course) % 360;
+      if (v.operationalStatus !== 'alerta') v.operationalStatus = speedKmh > 3 ? 'en_ruta' : 'detenido';
+      v.lastReportAt = input.fixTime;
+      v.positionSource = 'smartphone';
+      v.positionSourceLabel = `Celular de ${d.name}`;
+    }
+    this.persistSoon();
+    return { matched: true, vehicleId: v.id, phone: true };
+  }
+
+  /** Alarms from the phone (e.g. SOS) become alerts on the driver's unit. */
+  private ingestPhoneEvent(
+    d: Driver,
+    input: { type: string; alarm?: string; eventTime: string; latitude?: number; longitude?: number }
+  ): { matched: boolean; alertId?: string } {
+    const t = d.phoneTracker!;
+    if (input.type === 'deviceOnline') t.lastSeenAt = input.eventTime;
+    if (input.type !== 'alarm') {
+      this.persistSoon();
+      return { matched: true };
+    }
+    const v = this.assignedVehicleOf(d);
+    const alarm = input.alarm ?? 'general';
+    const meta = TRACCAR_ALARMS[alarm] ?? { label: `Alarma del celular (${alarm})`, priority: 'media' as const, condition: null };
+    const rule = meta.condition
+      ? this.state.alertRules.find((r) => r.tenantId === d.tenantId && r.conditionType === meta.condition && r.active)
+      : undefined;
+    const hasEventFix = typeof input.latitude === 'number' && typeof input.longitude === 'number' && !(input.latitude === 0 && input.longitude === 0);
+    if (v && hasEventFix && !this.unitHasLiveDevice(v, Date.now())) {
+      v.lat = Number(input.latitude!.toFixed(6));
+      v.lng = Number(input.longitude!.toFixed(6));
+    }
+    // An alarm is an emergency: it carries where the phone is, even off shift.
+    const raw = this.lastPhoneRaw.get(d.id);
+    const where = hasEventFix
+      ? { lat: Number(input.latitude!.toFixed(6)), lng: Number(input.longitude!.toFixed(6)) }
+      : raw && Date.now() - raw.at < 5 * 60_000
+        ? raw
+        : undefined;
+    const place = where ? ` Ubicación del celular: ${where.lat}, ${where.lng}.` : ' El celular no envió su ubicación.';
+    const alert = this.phoneAlert(
+      d,
+      v,
+      rule?.name ?? meta.label,
+      meta.priority,
+      `${meta.label} enviada desde el celular de ${d.name}${v ? ` (${v.unitCode})` : ' (sin unidad asignada)'}.${place}`,
+      input.eventTime,
+      rule?.id ?? 'smartphone',
+      v && !where ? undefined : where
+    );
+    if (v && meta.priority === 'critica') v.operationalStatus = 'alerta';
+    this.persistSoon();
+    return { matched: true, alertId: alert.id };
+  }
+
+  /** «Celular del chofer sin señal»: the unit depends on the phone and it stopped reporting. Runs every minute. */
+  sweepPhones(now = Date.now()): number {
+    let raised = 0;
+    for (const d of this.state.drivers) {
+      const t = d.phoneTracker;
+      if (!t?.lastSeenAt) continue;
+      const v = this.assignedVehicleOf(d);
+      if (!v || v.positionSource !== 'smartphone' || v.operationalStatus !== 'en_ruta') continue;
+      if (now - Date.parse(t.lastSeenAt) < PHONE_OFFLINE_MINUTES * 60_000) continue;
+      if (t.offlineAlertFor === t.lastSeenAt || this.unitHasLiveDevice(v, now)) continue;
+      t.offlineAlertFor = t.lastSeenAt;
+      this.phoneAlert(
+        d,
+        v,
+        'Celular del chofer sin señal',
+        'alta',
+        `${v.unitCode} se rastrea con el celular de ${d.name} y no reporta desde hace más de ${PHONE_OFFLINE_MINUTES} minutos.`,
+        new Date(now).toISOString()
+      );
+      raised++;
+    }
+    if (raised) this.persistSoon();
+    return raised;
+  }
+
+  private phoneDriver(tenantId: string, driverId: string, allowAllTenants: boolean): Driver {
+    const d = this.state.drivers.find((x) => x.id === driverId && (allowAllTenants || x.tenantId === tenantId));
+    if (!d) throw new DomainError('Chofer no encontrado en tu empresa.', 404);
+    return d;
+  }
+
+  private identifierTaken(id: string, exceptDriverId?: string): boolean {
+    return (
+      this.state.devices.some((x) => x.terminalId === id || x.imei === id) ||
+      this.state.drivers.some((x) => x.id !== exceptDriverId && x.phoneTracker?.identifier === id)
+    );
+  }
+
+  /**
+   * Registers (or updates) the driver's phone. Keeps the identifier unless regenerate is set (new or lost phone).
+   * Returns the previous Traccar id when it must be deleted.
+   */
+  assignDriverPhone(
+    tenantId: string,
+    driverId: string,
+    input: { platform: PhonePlatform; regenerate?: boolean },
+    actorName: string,
+    actorRole: string,
+    allowAllTenants = false,
+    actorHidden = false
+  ): { driver: Driver; oldTraccarId?: number } {
+    const d = this.phoneDriver(tenantId, driverId, allowAllTenants);
+    if (d.enabled === false) throw new DomainError('El chofer está deshabilitado: habilitalo antes de conectar su celular.');
+    const current = d.phoneTracker;
+    let oldTraccarId: number | undefined;
+    let tracker: DriverPhoneTracker;
+    if (!current || input.regenerate) {
+      let identifier = newPhoneIdentifier();
+      for (let i = 0; i < 20 && this.identifierTaken(identifier, d.id); i++) identifier = newPhoneIdentifier();
+      if (this.identifierTaken(identifier, d.id)) throw new DomainError('No se pudo generar un identificador libre. Probá de nuevo.');
+      oldTraccarId = current?.traccarId;
+      tracker = { identifier, platform: input.platform, createdAt: new Date().toISOString() };
+    } else {
+      tracker = { ...current, platform: input.platform };
+    }
+    d.phoneTracker = tracker;
+    this.addAuditLog({
+      tenantId: d.tenantId,
+      actorName,
+      actorRole,
+      actorHidden,
+      module: 'Conexión Smartphone',
+      action: !current ? 'Celular dado de alta' : input.regenerate ? 'Nuevo identificador de celular' : 'Celular modificado',
+      targetLabel: d.name,
+      detail: `${tracker.identifier} · ${input.platform === 'ios' ? 'iPhone' : 'Android'}${
+        input.regenerate && current ? `. El identificador anterior ${current.identifier} deja de funcionar.` : ''
+      }`,
+    });
+    this.persist(this.state);
+    return { driver: d, oldTraccarId };
+  }
+
+  setPhoneProvisioning(driverId: string, result: { traccarId?: number; status: PhoneProvisioningStatus; message?: string }) {
+    const t = this.state.drivers.find((d) => d.id === driverId)?.phoneTracker;
+    if (!t) return;
+    if (result.traccarId !== undefined) t.traccarId = result.traccarId;
+    if (t.provisioning?.status === 'conectado') t.provisioning = { ...t.provisioning, message: result.message };
+    else t.provisioning = { status: result.status, message: result.message, at: new Date().toISOString() };
+    this.persistSoon();
+  }
+
+  getDriverPhone(tenantId: string, driverId: string, allowAllTenants = false): Driver {
+    return this.phoneDriver(tenantId, driverId, allowAllTenants);
+  }
+
+  removeDriverPhone(
+    tenantId: string,
+    driverId: string,
+    actorName: string,
+    actorRole: string,
+    allowAllTenants = false,
+    actorHidden = false
+  ): DriverPhoneTracker {
+    const d = this.phoneDriver(tenantId, driverId, allowAllTenants);
+    const t = d.phoneTracker;
+    if (!t) throw new DomainError('El chofer no tiene celular conectado.', 404);
+    d.phoneTracker = undefined;
+    const v = this.assignedVehicleOf(d);
+    if (v?.positionSource === 'smartphone') v.positionSourceLabel = `Celular de ${d.name} (retirado)`;
+    this.addAuditLog({
+      tenantId: d.tenantId,
+      actorName,
+      actorRole,
+      actorHidden,
+      module: 'Conexión Smartphone',
+      action: 'Celular retirado',
+      targetLabel: d.name,
+      detail: `Se quitó el celular ${t.identifier}.`,
+    });
+    this.persist(this.state);
+    return t;
+  }
+
+  /** Rows of the «Conexión Smartphone» tab (scope 'all' = every company, superadmin). */
+  listPhones(scopeTenantId: string): PhoneListItem[] {
+    return this.state.drivers
+      .filter((d) => scopeTenantId === 'all' || d.tenantId === scopeTenantId)
+      .map((d) => {
+        const v = this.assignedVehicleOf(d);
+        return {
+          driverId: d.id,
+          tenantId: d.tenantId,
+          tenantName: this.state.tenants.find((t) => t.id === d.tenantId)?.name,
+          driverName: d.name,
+          driverPhone: d.phone,
+          enabled: d.enabled !== false,
+          assignedVehicle: v ? { id: v.id, unitCode: v.unitCode, plate: v.plate, positionSource: v.positionSource } : undefined,
+          tracker: d.phoneTracker,
+        };
+      })
+      .sort((a, b) => Number(Boolean(b.tracker)) - Number(Boolean(a.tracker)) || a.driverName.localeCompare(b.driverName));
+  }
+
+  // ---- OBD-II telemetry ------------------------------------------------------
+
+  private static readonly OBD_ACTOR = { name: 'Telemetría OBD-II', role: 'Sistema' };
+
+  /** Copies engine data to the unit and turns new trouble codes into an alert plus a corrective work order. */
+  private applyObdReading(v: Vehicle, dev: Device, obd: ObdReading, at: string) {
+    if (obd.rpm !== undefined) v.rpm = Math.round(obd.rpm);
+    if (obd.coolantTempC !== undefined) v.coolantTempC = Math.round(obd.coolantTempC);
+    if (obd.fuelPct !== undefined) v.fuelLevelPct = Math.round(obd.fuelPct);
+    if (obd.odometerKm !== undefined) v.odometerKm = obd.odometerKm;
+    if (obd.engineHours !== undefined) v.engineHours = obd.engineHours;
+    if (obd.batteryV !== undefined) v.batteryVoltage = obd.batteryV;
+    if (obd.vin) {
+      dev.vin = obd.vin;
+      if (!v.vin) v.vin = obd.vin;
+    }
+    v.telemetrySourceEngine = 'obd';
+    dev.lastObdAt = at;
+    if (dev.provisioning?.status !== 'conectado') {
+      dev.provisioning = { status: 'conectado', at, firstReportAt: at };
+      this.addAuditLog({
+        tenantId: v.tenantId,
+        actorName: FleetStore.OBD_ACTOR.name,
+        actorRole: FleetStore.OBD_ACTOR.role,
+        module: 'Telemetría OBD-II',
+        action: 'Equipo OBD-II conectado',
+        targetLabel: v.unitCode,
+        detail: `Primer reporte del equipo ${dev.imei} con datos del motor.`,
+      });
+    }
+    if (obd.dtcs) this.syncObdFaults(v, obd.dtcs, at);
+    this.recordObdSample(v, obd, at);
+  }
+
+  /** Last stored history sample per unit (ms); limits the history to one sample per minute. */
+  private lastObdSample = new Map<string, number>();
+  /** Pending history writes; queries wait for them so a reading is visible right after ingest. */
+  private obdWrites: Promise<unknown> = Promise.resolve();
+  static readonly OBD_SAMPLE_EVERY_MS = 60_000;
+  static readonly OBD_RETENTION_DAYS = 90;
+
+  private queueObdWrite(label: string, fn: () => Promise<unknown>) {
+    this.obdWrites = this.obdWrites.then(fn).catch((err) => console.error(`[db] ${label}:`, err));
+  }
+
+  private recordObdSample(v: Vehicle, obd: ObdReading, at: string) {
+    const t = Date.parse(at);
+    if (!Number.isFinite(t)) return;
+    const last = this.lastObdSample.get(v.id);
+    if (last !== undefined && Math.abs(t - last) < FleetStore.OBD_SAMPLE_EVERY_MS) return;
+    this.lastObdSample.set(v.id, t);
+    const sample = {
+      tenantId: v.tenantId,
+      vehicleId: v.id,
+      at,
+      rpm: obd.rpm,
+      coolantC: obd.coolantTempC,
+      fuelPct: obd.fuelPct,
+      batteryV: obd.batteryV,
+      odometerKm: obd.odometerKm,
+      speedKmh: v.speedKmh,
+    };
+    this.queueObdWrite('insertObdSample', () => this.repo.insertObdSample(sample));
+  }
+
+  /** Deletes history older than the retention window. Runs at startup and every 24 h. */
+  async purgeObdHistory(): Promise<number> {
+    const cutoff = new Date(Date.now() - FleetStore.OBD_RETENTION_DAYS * 86_400_000).toISOString();
+    return this.repo.purgeObdSamples(cutoff);
+  }
+
+  private obdVehicle(tenantId: string, vehicleId: string, allowAllTenants: boolean): Vehicle | undefined {
+    return this.state.vehicles.find((x) => x.id === vehicleId && (allowAllTenants || x.tenantId === tenantId));
+  }
+
+  /** Engine history of a unit, aggregated so each range returns at most ~300 points. */
+  async getObdHistory(
+    tenantId: string,
+    vehicleId: string,
+    range: ObdHistoryRange,
+    allowAllTenants = false
+  ): Promise<ObdHistoryPoint[] | null> {
+    const v = this.obdVehicle(tenantId, vehicleId, allowAllTenants);
+    if (!v) return null;
+    const spec = { '24h': { hours: 24, bucket: 300 }, '7d': { hours: 168, bucket: 3600 }, '30d': { hours: 720, bucket: 6 * 3600 } }[range];
+    await this.obdWrites;
+    const from = new Date(Date.now() - spec.hours * 3_600_000).toISOString();
+    return this.repo.obdHistory(v.tenantId, v.id, from, spec.bucket);
+  }
+
+  async getObdFaultHistory(tenantId: string, vehicleId: string, allowAllTenants = false): Promise<ObdFaultEvent[] | null> {
+    const v = this.obdVehicle(tenantId, vehicleId, allowAllTenants);
+    if (!v) return null;
+    await this.obdWrites;
+    return this.repo.listObdFaults(v.tenantId, v.id);
+  }
+
+  /** The OBD-II tracker of a unit (tenant-scoped). */
+  getObdDevice(tenantId: string, vehicleId: string, allowAllTenants = false): { vehicle: Vehicle; device?: Device } | null {
+    const v = this.obdVehicle(tenantId, vehicleId, allowAllTenants);
+    if (!v) return null;
+    return { vehicle: v, device: v.obdDeviceId ? this.state.devices.find((d) => d.id === v.obdDeviceId) : undefined };
+  }
+
+  /** Result of creating the tracker in Traccar. */
+  setObdProvisioning(deviceId: string, result: { traccarId?: number; status: ObdProvisioningStatus; message?: string }) {
+    const dev = this.state.devices.find((d) => d.id === deviceId);
+    if (!dev) return;
+    if (result.traccarId !== undefined) dev.traccarId = result.traccarId;
+    if (dev.provisioning?.status === 'conectado') {
+      // Already reporting: keep it connected, only remember a Traccar problem in the message.
+      dev.provisioning = { ...dev.provisioning, message: result.message };
+    } else {
+      dev.provisioning = { status: result.status, message: result.message, at: new Date().toISOString() };
+    }
+    this.persistSoon();
+  }
+
+  /** Stores a remote command in the tracker log (newest first, max 20) and audits it. */
+  recordObdCommand(
+    deviceId: string,
+    entry: Omit<ObdCommandEntry, 'id' | 'at'>,
+    actorRole: string,
+    actorHidden = false
+  ): ObdCommandEntry | null {
+    const dev = this.state.devices.find((d) => d.id === deviceId);
+    if (!dev) return null;
+    const full: ObdCommandEntry = { id: `cmd-${uid()}`, at: new Date().toISOString(), ...entry };
+    dev.commandLog = [full, ...(dev.commandLog ?? [])].slice(0, 20);
+    const outcome =
+      entry.status === 'en_cola'
+        ? 'en cola hasta que el equipo se conecte'
+        : entry.status === 'error'
+          ? `error: ${entry.response ?? ''}`
+          : 'enviado';
+    this.addAuditLog({
+      tenantId: dev.tenantId,
+      actorName: entry.actorName,
+      actorRole,
+      actorHidden,
+      module: 'Telemetría OBD-II',
+      action: 'Comando OBD-II enviado',
+      targetLabel: dev.unitCode,
+      detail: `${entry.label} (${entry.text.trim()}) → ${outcome}.`,
+    });
+    this.persist(this.state);
+    return full;
+  }
+
+  private syncObdFaults(v: Vehicle, codes: string[], at: string) {
+    // Once the OBD reports, its list replaces demo codes; CAN codes from other sources stay.
+    const kept = v.faultCodes.filter((f) => f.source === 'can');
+    const previous = new Map(v.faultCodes.filter((f) => f.source === 'obd').map((f) => [f.code, f]));
+    const cleared = [...previous.keys()].filter((c) => !codes.includes(c));
+    const next = codes.map((code) => {
+      const existing = previous.get(code);
+      if (existing) return existing;
+      const info = describeDtc(code);
+      const fault: FaultCode = { ...info, source: 'obd', firstSeenAt: at };
+      this.raiseObdFault(v, fault, at);
+      return fault;
+    });
+    v.faultCodes = [...kept, ...next];
+    for (const code of cleared) {
+      this.queueObdWrite('clearObdFault', () => this.repo.clearObdFault(v.id, code, at));
+      this.addAuditLog({
+        tenantId: v.tenantId,
+        actorName: FleetStore.OBD_ACTOR.name,
+        actorRole: FleetStore.OBD_ACTOR.role,
+        module: 'Telemetría OBD-II',
+        action: 'Falla borrada',
+        targetLabel: v.unitCode,
+        detail: `El código ${code} ya no está activo en la computadora del vehículo. La orden de trabajo, si existe, sigue abierta para que el taller la cierre.`,
+      });
+    }
+  }
+
+  /** Alert + corrective work order (one per unit and code while an order is open). */
+  private raiseObdFault(v: Vehicle, fault: FaultCode, at: string) {
+    const priority = fault.severity === 'critica' ? 'critica' : 'alta';
+    this.state.alerts.unshift({
+      id: `alr-${uid()}`,
+      tenantId: v.tenantId,
+      vehicleId: v.id,
+      unitCode: v.unitCode,
+      plate: v.plate,
+      driverName: v.driverName,
+      ruleId: 'obd',
+      ruleName: `Falla OBD-II ${fault.code}`,
+      priority,
+      status: 'pendiente',
+      lat: v.lat,
+      lng: v.lng,
+      speedKmh: v.speedKmh,
+      timestamp: at,
+      clipId: null,
+      summary: `${fault.code}: ${fault.description} (${fault.system}). Reportado por el equipo OBD-II.`,
+    });
+    const open = this.state.workOrders.find(
+      (o) => o.vehicleId === v.id && o.status !== 'completada' && o.status !== 'cancelada' && o.title.includes(fault.code)
+    );
+    if (open) {
+      fault.workOrderId = open.id;
+    } else {
+      const order = this.createWorkOrder(
+      v.tenantId,
+      {
+        vehicleId: v.id,
+        type: 'correctivo',
+        priority: fault.severity === 'critica' ? 'critica' : 'alta',
+        title: `Falla OBD-II ${fault.code}: ${fault.description}`.slice(0, 160),
+        workshopOrTech: 'Taller a definir',
+        scheduledDate: at.slice(0, 10),
+        parts: [],
+        laborCost: 0,
+        notes: `Abierta automáticamente por la telemetría OBD-II. Sistema: ${fault.system}. Verificar con escáner antes de reparar.`,
+        clearFaultsOnClose: true,
+      },
+      FleetStore.OBD_ACTOR.name,
+      FleetStore.OBD_ACTOR.role,
+      true,
+      false
+    );
+      if (order) fault.workOrderId = order.id;
+    }
+    const event = {
+      id: `obdf-${uid()}`,
+      tenantId: v.tenantId,
+      vehicleId: v.id,
+      code: fault.code,
+      description: fault.description,
+      severity: fault.severity,
+      system: fault.system,
+      openedAt: at,
+      workOrderId: fault.workOrderId ?? null,
+    };
+    this.queueObdWrite('openObdFault', () => this.repo.openObdFault(event));
+  }
+
+  /** Installs (or replaces) the OBD-II tracker of a unit. Its Traccar identifier is the IMEI. */
+  assignObdDevice(
+    tenantId: string,
+    vehicleId: string,
+    input: { imei: string; catalogModelId?: string; vin?: string; apn?: string },
+    actorName: string,
+    actorRole: string,
+    allowAllTenants = false,
+    actorHidden = false
+  ): Device | null {
+    const v = this.state.vehicles.find((x) => x.id === vehicleId && (allowAllTenants || x.tenantId === tenantId));
+    if (!v) return null;
+    const current = v.obdDeviceId ? this.state.devices.find((d) => d.id === v.obdDeviceId) : undefined;
+    const clash = this.state.devices.find((d) => d.id !== current?.id && (d.imei === input.imei || d.terminalId === input.imei));
+    if (clash) throw new DomainError(`Ese IMEI ya está registrado en el equipo de la unidad ${clash.unitCode}.`);
+    const model = findCatalogModel(input.catalogModelId) ?? findCatalogModel('teltonika-fmc003');
+    const label = model ? `${model.vendor} ${model.model}` : 'Rastreador OBD-II';
+    const nowIso = new Date().toISOString();
+    const dev: Device = current ?? {
+      id: `dev-obd-${uid()}`,
+      tenantId: v.tenantId,
+      vehicleId: v.id,
+      unitCode: v.unitCode,
+      imei: input.imei,
+      iccid: '',
+      simCarrier: '',
+      model: label,
+      protocol: 'Traccar',
+      firmware: '',
+      channels: [],
+      linkStatus: 'desconectado',
+      hardwareValidated: false,
+      lastHeartbeatAt: nowIso,
+      dashcamConfig: buildDefaultDashcamConfig(label, 'Traccar', this.state.dashcamDrivers, actorName),
+      terminalId: input.imei,
+      uplink: 'celular',
+      telemetrySource: 'simulada',
+      role: 'telemetria',
+    };
+    const before = current ? `${current.imei} · ${current.model}` : 'sin equipo';
+    if (current && current.imei !== input.imei) {
+      // Another tracker: it must report again; the route recreates it in Traccar.
+      dev.lastObdAt = undefined;
+      dev.provisioning = undefined;
+      dev.traccarId = undefined;
+      dev.commandLog = [];
+    }
+    if (input.apn !== undefined) dev.apn = input.apn || undefined;
+    dev.imei = input.imei;
+    dev.terminalId = input.imei;
+    dev.model = label;
+    if (model) dev.catalogModelId = model.id;
+    if (!current) this.state.devices.push(dev);
+    v.obdDeviceId = dev.id;
+    if (input.vin) v.vin = input.vin.toUpperCase();
+    this.unmatchedDevices.delete(input.imei);
+    this.addAuditLog({
+      tenantId: v.tenantId,
+      actorName,
+      actorRole,
+      actorHidden,
+      module: 'Telemetría OBD-II',
+      action: current ? 'Equipo OBD-II modificado' : 'Equipo OBD-II instalado',
+      targetLabel: v.unitCode,
+      detail: `Antes: ${before}. Ahora: ${dev.imei} · ${dev.model}${v.vin ? ` · VIN ${v.vin}` : ''}.`,
+    });
+    this.persist(this.state);
+    return dev;
+  }
+
+  /** Removes the OBD-II tracker; engine data goes back to demo values. Active faults stay until repaired. */
+  removeObdDevice(
+    tenantId: string,
+    vehicleId: string,
+    actorName: string,
+    actorRole: string,
+    allowAllTenants = false,
+    actorHidden = false
+  ): Device | null {
+    const v = this.state.vehicles.find((x) => x.id === vehicleId && (allowAllTenants || x.tenantId === tenantId));
+    if (!v || !v.obdDeviceId) return null;
+    const dev = this.state.devices.find((d) => d.id === v.obdDeviceId);
+    this.state.devices = this.state.devices.filter((d) => d.id !== v.obdDeviceId);
+    v.obdDeviceId = undefined;
+    v.telemetrySourceEngine = 'simulada';
+    this.addAuditLog({
+      tenantId: v.tenantId,
+      actorName,
+      actorRole,
+      actorHidden,
+      module: 'Telemetría OBD-II',
+      action: 'Equipo OBD-II retirado',
+      targetLabel: v.unitCode,
+      detail: `Se quitó el equipo ${dev?.imei ?? ''} (${dev?.model ?? ''}).`,
+    });
+    this.lastObdSample.delete(v.id);
+    this.persist(this.state);
+    return dev ?? null;
+  }
+
+  /** Applies an event forwarded by Traccar (alarms, online/offline). */
+  ingestTraccarEvent(input: {
+    uniqueId: string;
+    deviceName?: string;
+    type: string;
+    alarm?: string;
+    eventTime: string;
+    latitude?: number;
+    longitude?: number;
+    speedKnots?: number;
+    /** Reply text of a commandResult event. */
+    result?: string;
+  }): { matched: boolean; alertId?: string } {
+    const dev = this.findDeviceByUniqueId(input.uniqueId);
+    if (!dev) {
+      const driver = this.findPhoneDriver(input.uniqueId);
+      if (driver) return this.ingestPhoneEvent(driver, input);
+      this.rememberUnmatched(input.uniqueId, input.deviceName, input.eventTime, input.latitude, input.longitude);
+      return { matched: false };
+    }
+    if (input.type === 'deviceOnline') {
+      dev.linkStatus = 'conectado';
+      dev.lastHeartbeatAt = input.eventTime;
+      this.persistSoon();
+      return { matched: true };
+    }
+    if (input.type === 'deviceOffline' || input.type === 'deviceUnknown') {
+      dev.linkStatus = 'desconectado';
+      this.persistSoon();
+      return { matched: true };
+    }
+    if (input.type === 'commandResult') {
+      // Replies are matched to the oldest command still waiting for one.
+      const waiting = (dev.commandLog ?? []).filter((c) => c.status === 'enviado' || c.status === 'en_cola');
+      const target = waiting[waiting.length - 1];
+      if (target) {
+        target.status = 'respondido';
+        target.response = (input.result ?? '').slice(0, 1000);
+        target.respondedAt = input.eventTime;
+        this.persistSoon();
+      }
+      return { matched: true };
+    }
+    if (input.type !== 'alarm') return { matched: true };
+
+    const v = this.state.vehicles.find((x) => x.id === dev.vehicleId);
+    if (!v) return { matched: true };
+    const alarm = input.alarm ?? 'general';
+    const meta = TRACCAR_ALARMS[alarm] ?? { label: `Alarma del equipo (${alarm})`, priority: 'media' as const, condition: null };
+    const rule = meta.condition
+      ? this.state.alertRules.find((r) => r.tenantId === v.tenantId && r.conditionType === meta.condition && r.active)
+      : undefined;
+    const alert: AlertEvent = {
+      id: `alr-${uid()}`,
+      tenantId: v.tenantId,
+      vehicleId: v.id,
+      unitCode: v.unitCode,
+      plate: v.plate,
+      driverName: v.driverName,
+      ruleId: rule?.id ?? 'traccar',
+      ruleName: rule?.name ?? meta.label,
+      priority: meta.priority,
+      status: 'pendiente',
+      lat: input.latitude ?? v.lat,
+      lng: input.longitude ?? v.lng,
+      speedKmh: input.speedKnots != null ? Math.round(input.speedKnots * 1.852) : v.speedKmh,
+      timestamp: input.eventTime,
+      clipId: null,
+      summary: `${meta.label} reportada por el equipo ${dev.terminalId} vía Traccar.`,
+    };
+    this.state.alerts.unshift(alert);
+    if (meta.priority === 'critica') v.operationalStatus = 'alerta';
+    this.persistSoon();
+    return { matched: true, alertId: alert.id };
   }
 
   /** Returns the tenant id if it exists; never falls back to another company. */
@@ -1754,6 +2929,9 @@ class FleetStore {
       retentionDays: 90,
       planTier: 'Acceso Global',
       status: 'activo',
+      // Consolidated view: amounts converted to the platform reference currency.
+      currency: this.currency.platformReferenceCurrency,
+      referenceCurrency: this.currency.platformReferenceCurrency,
     };
   }
 
@@ -1772,7 +2950,292 @@ class FleetStore {
       isGlobalSuperadmin: Boolean(u.isHiddenSuperadmin),
       status: u.status,
       createdAt: u.createdAt,
+      ...(u.mustChangePassword ? { mustChangePassword: true } : {}),
     };
+  }
+
+  // ---- Companies (superadmin) ------------------------------------------------
+
+  /** 14 chars, no ambiguous characters (0/O, 1/l/I), always with letters and digits: meets the password policy. */
+  private generateTemporaryPassword(): string {
+    const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz';
+    const digits = '23456789';
+    const all = letters + digits;
+    for (;;) {
+      let out = '';
+      for (let i = 0; i < 14; i++) out += all[crypto.randomInt(all.length)];
+      if (/[A-Za-z]/.test(out) && /\d/.test(out)) return out;
+    }
+  }
+
+  private tenantIdFor(name: string): string {
+    const base = `ten-${fileSlug(name).slice(0, 40)}`;
+    let id = base;
+    for (let n = 2; this.state.tenants.some((t) => t.id === id); n++) id = `${base}-${n}`;
+    return id;
+  }
+
+  private findTenantByTaxId(taxId: string, exceptId?: string): Tenant | undefined {
+    const key = taxIdKey(taxId);
+    return this.state.tenants.find((t) => t.id !== exceptId && taxIdKey(t.taxId) === key);
+  }
+
+  private usernameTaken(username: string): boolean {
+    const u = username.trim().toLowerCase();
+    return this.state.users.some((x) => x.username.toLowerCase() === u);
+  }
+
+  /** Live availability for the wizard (no side effects). */
+  checkTenantAvailability(q: { cuit?: string; username?: string; name?: string; exceptTenantId?: string }) {
+    const result: { cuit?: 'ok' | 'invalido' | 'en_uso'; username?: 'ok' | 'invalido' | 'en_uso'; name?: 'ok' | 'en_uso'; cuitMessage?: string } = {};
+    if (q.cuit !== undefined) {
+      const problem = cuitProblem(q.cuit);
+      if (problem) {
+        result.cuit = 'invalido';
+        result.cuitMessage = CUIT_MESSAGES[problem];
+      } else {
+        result.cuit = this.findTenantByTaxId(q.cuit, q.exceptTenantId) ? 'en_uso' : 'ok';
+      }
+    }
+    if (q.username !== undefined) {
+      result.username = !/^[a-z0-9._-]{3,40}$/.test(q.username.trim().toLowerCase())
+        ? 'invalido'
+        : this.usernameTaken(q.username)
+          ? 'en_uso'
+          : 'ok';
+    }
+    if (q.name !== undefined) {
+      const n = q.name.trim().toLowerCase();
+      result.name = this.state.tenants.some((t) => t.id !== q.exceptTenantId && t.name.trim().toLowerCase() === n) ? 'en_uso' : 'ok';
+    }
+    return result;
+  }
+
+  listTenantSummaries(): TenantSummary[] {
+    return this.state.tenants.map((t) => {
+      const admin = this.state.users.find((u) => u.tenantId === t.id && u.roleId === `rol-${t.id}-admin`);
+      return {
+        ...t,
+        vehicleCount: this.state.vehicles.filter((v) => v.tenantId === t.id).length,
+        userCount: this.state.users.filter((u) => u.tenantId === t.id).length,
+        adminUsername: admin?.username ?? null,
+        adminName: admin?.name ?? null,
+      };
+    });
+  }
+
+  /**
+   * Wizard: company + its 3 base roles + an admin with full access to every module
+   * (temporary password, must be changed on first login) + optional starter templates.
+   * Everything is validated before anything is created.
+   */
+  async createTenantWithAdmin(
+    input: {
+      company: { name: string; cuit: string; city: string; branches: string[]; contactName: string; contactEmail: string; contactPhone: string };
+      service: {
+        status: 'activo' | 'piloto';
+        planTier: string;
+        vehicleQuota: number;
+        retentionDays: number;
+        currency?: string | null;
+        referenceCurrency?: string;
+      };
+      admin: { name: string; username: string };
+      templates: { preventivePlans: boolean; alertRules: boolean };
+    },
+    actorName: string
+  ): Promise<{ tenant: Tenant; admin: PublicUser; temporaryPassword: string }> {
+    const problem = cuitProblem(input.company.cuit);
+    if (problem) throw new DomainError(CUIT_MESSAGES[problem]);
+    if (this.findTenantByTaxId(input.company.cuit)) throw new DomainError('Ya existe una empresa registrada con ese CUIT.');
+    const availability = this.checkTenantAvailability({ name: input.company.name, username: input.admin.username });
+    if (availability.name === 'en_uso') throw new DomainError('Ya existe una empresa con ese nombre.');
+    if (availability.username === 'invalido') throw new DomainError('El usuario solo puede tener minúsculas, números, punto, guion o guion bajo (3 a 40).');
+    if (availability.username === 'en_uso') throw new DomainError('Ese nombre de usuario ya está en uso.');
+
+    const temporaryPassword = this.generateTemporaryPassword();
+    const passwordHash = await hashPassword(temporaryPassword);
+    // Re-check after the async hash: another request may have taken the CUIT or username meanwhile.
+    if (this.findTenantByTaxId(input.company.cuit)) throw new DomainError('Ya existe una empresa registrada con ese CUIT.');
+    if (this.usernameTaken(input.admin.username)) throw new DomainError('Ese nombre de usuario ya está en uso.');
+
+    for (const code of [input.service.currency, input.service.referenceCurrency]) {
+      if (code && !this.currency.find(code)?.enabled) throw new DomainError(`La moneda ${code} no existe o no está habilitada.`);
+    }
+    const now = new Date().toISOString();
+    const id = this.tenantIdFor(input.company.name);
+    const tenant: Tenant = {
+      id,
+      name: input.company.name.trim(),
+      taxId: formatCuit(input.company.cuit),
+      city: input.company.city.trim(),
+      branches: input.company.branches.map((b) => b.trim()),
+      vehicleQuota: input.service.vehicleQuota,
+      retentionDays: input.service.retentionDays,
+      planTier: input.service.planTier,
+      status: input.service.status,
+      contactName: input.company.contactName.trim(),
+      contactEmail: input.company.contactEmail.trim().toLowerCase(),
+      contactPhone: input.company.contactPhone.trim(),
+      createdAt: now,
+      currency: input.service.currency ?? null,
+      referenceCurrency: input.service.referenceCurrency ?? 'USD',
+    };
+    const roles = buildTenantBaseRoles(id);
+    const adminRole = roles.find((r) => r.isSystemAdminRole)!;
+    const admin: UserAccount = {
+      id: `usr-${uid()}`,
+      tenantId: id,
+      name: input.admin.name.trim(),
+      username: input.admin.username.trim().toLowerCase(),
+      passwordHash,
+      roleId: adminRole.id,
+      isCompanyAdmin: true,
+      isHiddenSuperadmin: false,
+      status: 'activo',
+      createdAt: now,
+      failedAttempts: 0,
+      lockedUntil: null,
+      mustChangePassword: true,
+    };
+
+    this.state.tenants.push(tenant);
+    this.state.roles.push(...roles);
+    this.state.users.push(admin);
+    const created: string[] = ['3 perfiles base', `usuario admin ${admin.username}`];
+    if (input.templates.preventivePlans) {
+      const plans = buildDefaultPreventivePlans(id, () => now);
+      this.state.preventivePlans.push(...plans);
+      created.push(`${plans.length} planes preventivos`);
+    }
+    if (input.templates.alertRules) {
+      const rules = buildDefaultAlertRules(id);
+      this.state.alertRules.push(...rules);
+      created.push(`${rules.length} reglas de alerta`);
+    }
+    for (const auditTenant of [GLOBAL_AUDIT_TENANT, id]) {
+      this.addAuditLog({
+        tenantId: auditTenant,
+        actorName,
+        actorRole: SUPERADMIN_ROLE.name,
+        actorHidden: auditTenant === GLOBAL_AUDIT_TENANT,
+        module: 'Empresas',
+        action: 'Alta de empresa',
+        targetLabel: `${tenant.name} (${tenant.taxId})`,
+        detail: `Plan ${tenant.planTier} · cupo ${tenant.vehicleQuota} unidades · ${created.join(' · ')}.`,
+      });
+    }
+    this.persist(this.state);
+    return { tenant, admin: this.toPublicUser(admin), temporaryPassword };
+  }
+
+  async updateTenant(
+    tenantId: string,
+    patch: Partial<{
+      name: string;
+      cuit: string;
+      city: string;
+      branches: string[];
+      contactName: string;
+      contactEmail: string;
+      contactPhone: string;
+      status: TenantStatus;
+      planTier: string;
+      vehicleQuota: number;
+      retentionDays: number;
+      referenceCurrency: string;
+    }>,
+    actorName: string
+  ): Promise<TenantSummary> {
+    const tenant = this.state.tenants.find((t) => t.id === tenantId);
+    if (!tenant) throw new DomainError('La empresa no existe.');
+
+    // Validate everything first
+    if (patch.cuit !== undefined && taxIdKey(patch.cuit) !== taxIdKey(tenant.taxId)) {
+      const problem = cuitProblem(patch.cuit);
+      if (problem) throw new DomainError(CUIT_MESSAGES[problem]);
+      if (this.findTenantByTaxId(patch.cuit, tenantId)) throw new DomainError('Ya existe una empresa registrada con ese CUIT.');
+    }
+    if (patch.name !== undefined && this.checkTenantAvailability({ name: patch.name, exceptTenantId: tenantId }).name === 'en_uso') {
+      throw new DomainError('Ya existe una empresa con ese nombre.');
+    }
+    const vehicleCount = this.state.vehicles.filter((v) => v.tenantId === tenantId).length;
+    if (patch.vehicleQuota !== undefined && patch.vehicleQuota < vehicleCount) {
+      throw new DomainError(`El cupo no puede ser menor que las ${vehicleCount} unidades ya registradas.`);
+    }
+
+    const changes: string[] = [];
+    const set = <K extends keyof Tenant>(key: K, value: Tenant[K] | undefined, label: string) => {
+      if (value === undefined || JSON.stringify(tenant[key]) === JSON.stringify(value)) return;
+      tenant[key] = value;
+      changes.push(label);
+    };
+    set('name', patch.name?.trim(), 'nombre');
+    if (patch.cuit !== undefined && taxIdKey(patch.cuit) !== taxIdKey(tenant.taxId)) set('taxId', formatCuit(patch.cuit), 'CUIT');
+    set('city', patch.city?.trim(), 'ciudad');
+    set('branches', patch.branches?.map((b) => b.trim()), 'sucursales');
+    set('contactName', patch.contactName?.trim(), 'contacto');
+    set('contactEmail', patch.contactEmail?.trim().toLowerCase(), 'email de contacto');
+    set('contactPhone', patch.contactPhone?.trim(), 'teléfono de contacto');
+    set('planTier', patch.planTier, 'plan');
+    set('vehicleQuota', patch.vehicleQuota, 'cupo');
+    set('retentionDays', patch.retentionDays, 'retención de video');
+    if (patch.referenceCurrency !== undefined && patch.referenceCurrency !== tenant.referenceCurrency) {
+      if (!this.currency.find(patch.referenceCurrency)?.enabled) throw new DomainError('La moneda de referencia no está habilitada.');
+      set('referenceCurrency', patch.referenceCurrency, 'moneda de referencia');
+    }
+    const previousStatus = tenant.status;
+    set('status', patch.status, 'estado');
+
+    if (changes.length === 0) return this.listTenantSummaries().find((t) => t.id === tenantId)!;
+
+    const suspended = previousStatus !== 'suspendido' && tenant.status === 'suspendido';
+    const reactivated = previousStatus === 'suspendido' && tenant.status !== 'suspendido';
+    for (const auditTenant of [GLOBAL_AUDIT_TENANT, tenantId]) {
+      this.addAuditLog({
+        tenantId: auditTenant,
+        actorName,
+        actorRole: SUPERADMIN_ROLE.name,
+        actorHidden: auditTenant === GLOBAL_AUDIT_TENANT,
+        module: 'Empresas',
+        action: suspended ? 'Suspensión de empresa' : reactivated ? 'Reactivación de empresa' : 'Edición de empresa',
+        targetLabel: tenant.name,
+        detail: `Cambios: ${changes.join(', ')}.`,
+      });
+    }
+    this.persist(this.state);
+    if (suspended) {
+      for (const u of this.state.users.filter((x) => x.tenantId === tenantId)) await this.revokeUserSessions(u.id);
+    }
+    return this.listTenantSummaries().find((t) => t.id === tenantId)!;
+  }
+
+  async resetTenantAdminPassword(tenantId: string, actorName: string): Promise<{ username: string; temporaryPassword: string }> {
+    const tenant = this.state.tenants.find((t) => t.id === tenantId);
+    if (!tenant) throw new DomainError('La empresa no existe.');
+    const admin = this.state.users.find((u) => u.tenantId === tenantId && u.roleId === `rol-${tenantId}-admin`);
+    if (!admin) throw new DomainError('La empresa no tiene un usuario administrador.');
+    const temporaryPassword = this.generateTemporaryPassword();
+    admin.passwordHash = await hashPassword(temporaryPassword);
+    admin.mustChangePassword = true;
+    admin.failedAttempts = 0;
+    admin.lockedUntil = null;
+    admin.status = 'activo';
+    for (const auditTenant of [GLOBAL_AUDIT_TENANT, tenantId]) {
+      this.addAuditLog({
+        tenantId: auditTenant,
+        actorName,
+        actorRole: SUPERADMIN_ROLE.name,
+        actorHidden: auditTenant === GLOBAL_AUDIT_TENANT,
+        module: 'Empresas',
+        action: 'Restablecimiento de contraseña del admin',
+        targetLabel: `${tenant.name} · ${admin.username}`,
+        detail: 'Contraseña temporal generada; deberá cambiarse en el primer ingreso. Sesiones cerradas.',
+      });
+    }
+    this.persist(this.state);
+    await this.revokeUserSessions(admin.id);
+    return { username: admin.username, temporaryPassword };
   }
 
   getTenantById(tenantId: string): Tenant | undefined {
@@ -1824,6 +3287,13 @@ class FleetStore {
       return invalid;
     }
     if (account.status !== 'activo') return invalid;
+    if (!account.isHiddenSuperadmin && this.state.tenants.find((t) => t.id === account.tenantId)?.status === 'suspendido') {
+      return {
+        ok: false,
+        status: 423,
+        error: 'La empresa está suspendida. Contacta al administrador de la plataforma.',
+      };
+    }
 
     const isSuperadmin = Boolean(account.isHiddenSuperadmin);
     const tenant = isSuperadmin
@@ -1888,7 +3358,7 @@ class FleetStore {
 
     const tenant = this.state.tenants.find((t) => t.id === session.tenantId);
     const role = this.state.roles.find((r) => r.id === user.roleId && r.tenantId === session.tenantId);
-    if (!tenant || !role) return null;
+    if (!tenant || !role || tenant.status === 'suspendido') return null;
     return { session, user, role, tenant };
   }
 
@@ -1923,7 +3393,11 @@ class FleetStore {
     const policyError = validatePasswordPolicy(newPassword);
     if (policyError) return { ok: false, error: policyError, status: 400 };
 
+    if (newPassword === currentPassword) {
+      return { ok: false, error: 'La contraseña nueva debe ser distinta de la actual.', status: 400 };
+    }
     user.passwordHash = await hashPassword(newPassword);
+    user.mustChangePassword = false;
     this.addAuditLog({
       tenantId: user.tenantId,
       actorName: user.name,
@@ -1963,6 +3437,11 @@ class FleetStore {
       const scopedVehicles = byScope(this.state.vehicles);
 
       return {
+        deviceConnection: this.getDeviceConnectionSettings(),
+        currencies: this.currency.list(),
+        exchangeRates: this.currency.ratesForClient(),
+        platformReferenceCurrency: this.currency.platformReferenceCurrency,
+        unmatchedDevices: [...this.unmatchedDevices.values()].sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt)),
         tenant: activeTenant,
         availableTenants: this.state.tenants,
         activeScopeTenantId: validScope,
@@ -2006,12 +3485,17 @@ class FleetStore {
     const tenantVehicles = this.state.vehicles.filter((v) => v.tenantId === tenantId);
 
     return {
+      deviceConnection: this.getDeviceConnectionSettings(),
+      currencies: this.currency.list().filter((c) => c.enabled),
+      exchangeRates: this.currency.ratesForClient(),
       tenant,
       currentUser: this.toPublicUser(currentAccount),
       currentRole,
       users: publicUsers,
       roles: tenantRoles,
-      drivers: this.state.drivers.filter((d) => d.tenantId === tenantId),
+      drivers: this.state.drivers
+        .filter((d) => d.tenantId === tenantId)
+        .map((d) => (currentRole?.isSystemAdminRole ? d : DriverRegistry.redact(d))),
       vehicles: tenantVehicles,
       devices: this.state.devices.filter((d) => d.tenantId === tenantId),
       maintenanceRecords: this.state.maintenanceRecords.filter((m) => m.tenantId === tenantId),
@@ -2057,35 +3541,49 @@ class FleetStore {
       const bucket: MonthlyCostBucket = {
         monthKey: key,
         monthLabel: label,
-        refaccionesMxn: 0,
-        insumosMxn: 0,
-        manoObraMxn: 0,
-        totalMxn: 0,
+        refacciones: 0,
+        insumos: 0,
+        manoObra: 0,
+        total: 0,
         ordersCount: 0,
       };
       monthBuckets.push(bucket);
       monthMap.set(key, bucket);
     }
 
+    // Consolidated view (all companies): every amount converted to the platform reference
+    // currency with the rate of the order's date. Orders that can't be converted are left out
+    // (and counted) instead of mixing currencies.
+    const reference = this.currency.platformReferenceCurrency;
+    let excludedOrders = 0;
     for (const wo of workOrders) {
       if (wo.status === 'cancelada') continue;
       const dateIso = wo.completedAt || wo.createdAt || wo.scheduledDate;
       const monthKey = dateIso.slice(0, 7);
       const bucket = monthMap.get(monthKey);
       if (!bucket) continue;
+      let factor = 1;
+      if (isAll) {
+        const one = this.currency.convertTenantAmount(wo.tenantId, 1, reference, dateIso.length === 10 ? `${dateIso}T23:59:59Z` : dateIso);
+        if (one === null) {
+          excludedOrders++;
+          continue;
+        }
+        factor = one;
+      }
       let refacc = 0;
       let ins = 0;
       let extraLabor = 0;
       for (const p of wo.parts) {
-        if (p.category === 'refaccion') refacc += p.subtotalMxn;
-        else if (p.category === 'insumo') ins += p.subtotalMxn;
-        else extraLabor += p.subtotalMxn;
+        if (p.category === 'refaccion') refacc += p.subtotal * factor;
+        else if (p.category === 'insumo') ins += p.subtotal * factor;
+        else extraLabor += p.subtotal * factor;
       }
-      const labor = wo.laborCostMxn + extraLabor;
-      bucket.refaccionesMxn = Math.round(bucket.refaccionesMxn + refacc);
-      bucket.insumosMxn = Math.round(bucket.insumosMxn + ins);
-      bucket.manoObraMxn = Math.round(bucket.manoObraMxn + labor);
-      bucket.totalMxn = Math.round(bucket.refaccionesMxn + bucket.insumosMxn + bucket.manoObraMxn);
+      const labor = wo.laborCost * factor + extraLabor;
+      bucket.refacciones = Math.round(bucket.refacciones + refacc);
+      bucket.insumos = Math.round(bucket.insumos + ins);
+      bucket.manoObra = Math.round(bucket.manoObra + labor);
+      bucket.total = Math.round(bucket.refacciones + bucket.insumos + bucket.manoObra);
       bucket.ordersCount += 1;
     }
 
@@ -2187,7 +3685,10 @@ class FleetStore {
       criticalFaultUnitsCount,
       lowStockPartsCount,
       autoGeneratedOrdersCount,
-      currentMonthTotalMxn: currentBucket?.totalMxn ?? 0,
+      currentMonthTotal: currentBucket?.total ?? 0,
+      currency: isAll ? reference : this.currency.tenantCurrency(targetScope),
+      consolidated: isAll,
+      excludedOrders,
       totalFleetOdometerKm: Math.round(totalFleetOdometerKm),
       totalFleetEngineHours: Number(totalFleetEngineHours.toFixed(1)),
       unitsInsideCorridor,
@@ -2202,6 +3703,12 @@ class FleetStore {
     return this.state.users
       .filter((u) => u.tenantId === tenantId && !u.isHiddenSuperadmin && u.roleId !== 'super_admin_internal')
       .map((u) => this.toPublicUser(u));
+  }
+
+  /** Amount of a company formatted in its currency (audit texts). */
+  private money(tenantId: string, amount: number): string {
+    const code = this.currency.tenantCurrency(tenantId);
+    return formatMoney(amount, this.currency.find(code) ?? code, { withCode: true });
   }
 
   addAuditLog(entry: Omit<AuditLog, 'id' | 'timestamp'>): AuditLog {
@@ -2418,21 +3925,65 @@ class FleetStore {
       unitCode: string;
       plate: string;
       brandModel: string;
+      brand?: string;
+      model?: string;
       year: number;
       driverName: string;
       imei: string;
       protocol: ProtocolType;
+      /** obd = the tracker joins Telemetría OBD-II; smartphone = no hardware, the driver's phone reports. */
+      connection?: UnitConnection;
       deviceModel: string;
+      deviceCatalogId?: string;
+      /** Registered driver to assign; must belong to the company and be authorized. */
+      driverId?: string;
       engineHours?: number;
       odometerKm?: number;
     },
     actorName: string,
     actorRole: string
-  ): { vehicle: Vehicle; device: Device } {
+  ): { vehicle: Vehicle; device: Device | null } {
     const tenant = this.state.tenants.find((t) => t.id === this.requireTenant(tenantId))!;
+    const connection: UnitConnection = input.connection ?? (input.protocol === 'Traccar' ? 'traccar' : 'dashcam');
+    if (connection !== 'smartphone' && !/^\d{15}$/.test(input.imei)) {
+      throw new DomainError('Ingresa el IMEI de 15 dígitos del equipo.');
+    }
+    if (connection === 'obd') {
+      if (input.deviceCatalogId && findCatalogModel(input.deviceCatalogId)?.kind !== 'GPS + CAN') {
+        throw new DomainError('Para Telemetría OBD-II elige un rastreador Teltonika (FMC003, FMC130 o FMC650).');
+      }
+      const clash = this.state.devices.find((d) => d.imei === input.imei || d.terminalId === input.imei);
+      if (clash) throw new DomainError(`Ese IMEI ya está registrado en el equipo de la unidad ${clash.unitCode}.`);
+    }
+    const registered = this.state.vehicles.filter((v) => v.tenantId === tenant.id).length;
+    if (registered >= tenant.vehicleQuota) {
+      throw new DomainError(`Se alcanzó el cupo de ${tenant.vehicleQuota} unidades del plan de ${tenant.name}.`);
+    }
+    // Resolve the equipment before touching state, so a bad catalog id changes nothing.
+    const catalogModel = input.deviceCatalogId ? findCatalogModel(input.deviceCatalogId) : undefined;
+    if (input.deviceCatalogId && !catalogModel) {
+      throw new DomainError('El modelo de equipo elegido no existe en el catálogo.');
+    }
+    if (catalogModel && catalogModel.protocol !== input.protocol) {
+      throw new DomainError(`El equipo ${catalogModelLabel(catalogModel)} usa el protocolo ${catalogModel.protocol}, no ${input.protocol}.`);
+    }
+    const catalogDriver = catalogModel ? this.state.dashcamDrivers.find((d) => d.id === catalogModel.driverId) : undefined;
+    const assignedDriver = input.driverId
+      ? this.state.drivers.find((d) => d.id === input.driverId && d.tenantId === tenant.id)
+      : undefined;
+    if (input.driverId && !assignedDriver) throw new DomainError('El chofer elegido no pertenece a la empresa.');
+    if (assignedDriver) {
+      const auth = computeDriverAuthorization(assignedDriver);
+      if (auth.state === 'no_autorizado' || auth.state === 'deshabilitado' || auth.state === 'pendiente') {
+        throw new DomainError(`${assignedDriver.name} está «${AUTH_STATE_LABELS[auth.state]}» y no puede asignarse. ${auth.reasons[0] ?? ''}`.trim());
+      }
+    }
+    const brand = input.brand?.trim() || undefined;
+    const model = input.model?.trim() || undefined;
+    const brandModel = brand || model ? composeBrandModel(brand ?? '', model ?? '') : input.brandModel;
+
     const corridor = CORRIDORS.find((c) => c.branch === input.branch) ?? CORRIDORS[0];
     const num = this.state.vehicles.length + 1;
-    const driverId = `drv-${uid()}`;
     const vehicleId = `veh-${uid()}`;
     const deviceId = `dev-${uid()}`;
     const nowIso = new Date().toISOString();
@@ -2440,15 +3991,6 @@ class FleetStore {
     const engineHours = Number(input.engineHours ?? 120);
     const odometerKm = Number(input.odometerKm ?? 1200);
 
-    const driver: Driver = {
-      id: driverId,
-      tenantId: tenant.id,
-      branch: input.branch || tenant.branches[0],
-      name: input.driverName,
-      licenseNumber: input.assetType === 'maquinaria_pesada' ? `OP-MAQ-${1000 + num}` : `LIC-2026-${1000 + num}`,
-      phone: '+52 55 4890 2210',
-      status: 'activo',
-    };
 
     const defaultPlan =
       this.state.preventivePlans.find(
@@ -2465,17 +4007,19 @@ class FleetStore {
       assetType: input.assetType,
       unitCode: input.unitCode.toUpperCase(),
       plate: input.plate.toUpperCase(),
-      brandModel: input.brandModel,
-      year: input.year || 2025,
-      driverId,
-      driverName: input.driverName,
+      brandModel,
+      ...(brand ? { brand } : {}),
+      ...(model ? { model } : {}),
+      year: input.year || new Date().getFullYear(),
+      driverId: assignedDriver?.id ?? '',
+      driverName: assignedDriver?.name ?? 'Sin chofer asignado',
       deviceId,
       operationalStatus: 'detenido',
       ignition: false,
       speedKmh: 0,
       heading: 90,
-      lat: Number((corridor.lat + seededOffset(num, 0.08)).toFixed(5)),
-      lng: Number((corridor.lng + seededOffset(num + 7, 0.08)).toFixed(5)),
+      lat: Number((corridor.lat + seededOffset(num, UNIT_SPREAD / 2)).toFixed(5)),
+      lng: Number((corridor.lng + seededOffset(num + 7, UNIT_SPREAD / 2)).toFixed(5)),
       odometerKm,
       engineHours,
       nextServiceHours: engineHours + intervalHours,
@@ -2492,18 +4036,26 @@ class FleetStore {
       geofenceName: corridor.geofence,
     };
 
-    const devModel = input.deviceModel || 'Howen Hero-ME40-04';
-    const dashcamConfig = buildDefaultDashcamConfig(devModel, input.protocol, this.state.dashcamDrivers, actorName);
-    const matchedDriver = matchDriverForModel(devModel, input.protocol, this.state.dashcamDrivers);
+    const devModel = catalogModel
+      ? catalogModelLabel(catalogModel)
+      : input.deviceModel?.trim() || (input.protocol === 'Traccar' ? 'Equipo Traccar' : 'Equipo JT/T 808 genérico');
+    const matchedDriver = catalogDriver ?? matchDriverForModel(devModel, input.protocol, this.state.dashcamDrivers);
+    const dashcamConfig = buildDefaultDashcamConfig(devModel, input.protocol, this.state.dashcamDrivers, actorName, matchedDriver);
     const device: Device = {
       id: deviceId,
       tenantId: tenant.id,
       vehicleId,
       unitCode: vehicle.unitCode,
+      terminalId: this.state.devices.some((d) => d.terminalId === input.imei.slice(-12))
+        ? input.imei
+        : input.imei.slice(-12),
+      uplink: catalogModel?.uplinks[0] ?? 'wifi_starlink',
+      telemetrySource: 'simulada',
       imei: input.imei,
       iccid: `8952010099${Date.now().toString().slice(-8)}`,
       simCarrier: 'Telcel M2M IoT',
       model: devModel,
+      ...(catalogModel ? { catalogModelId: catalogModel.id } : {}),
       protocol: input.protocol,
       firmware: matchedDriver.driverVersion,
       channels: dashcamConfig.activeChannels,
@@ -2513,7 +4065,51 @@ class FleetStore {
       dashcamConfig,
     };
 
-    this.state.drivers.unshift(driver);
+    // One unit per driver: the driver leaves the unit they were driving.
+    if (assignedDriver) {
+      for (const other of this.state.vehicles) {
+        if (other.driverId === assignedDriver.id) {
+          other.driverId = '';
+          other.driverName = 'Sin chofer asignado';
+        }
+      }
+    }
+
+    if (connection === 'smartphone' || connection === 'obd') {
+      // No camera: either no hardware at all (the driver's phone reports) or an OBD-II tracker that the
+      // Telemetría OBD-II module owns (it also serves as the unit's main device).
+      vehicle.deviceId = '';
+      if (connection === 'smartphone') {
+        vehicle.positionSource = 'smartphone';
+        vehicle.positionSourceLabel = assignedDriver ? `Celular de ${assignedDriver.name}` : 'Celular del chofer';
+      }
+      this.state.vehicles.unshift(vehicle);
+      let obd: Device | null = null;
+      if (connection === 'obd') {
+        obd = this.assignObdDevice(tenant.id, vehicle.id, { imei: input.imei, catalogModelId: input.deviceCatalogId }, actorName, actorRole, true, actorRole === SUPERADMIN_ROLE.name);
+        if (obd) vehicle.deviceId = obd.id;
+      }
+      const phoneNote = connection === 'smartphone'
+        ? assignedDriver?.phoneTracker
+          ? ` La posición la manda el celular de ${assignedDriver.name} (${assignedDriver.phoneTracker.identifier}).`
+          : ' Falta conectar el celular del chofer en «Conexión Smartphone».'
+        : '';
+      this.addAuditLog({
+        tenantId: tenant.id,
+        actorName,
+        actorRole,
+        actorHidden: actorRole === SUPERADMIN_ROLE.name,
+        module: 'Flotas y Maquinaria',
+        action: 'Alta de activo y equipo',
+        targetLabel: `${vehicle.unitCode} (${vehicle.plate})`,
+        detail: `Registrado (${vehicle.assetType === 'maquinaria_pesada' ? 'Maquinaria Pesada' : 'Vehículo'}) con ${
+          connection === 'obd' ? `Telemetría OBD-II (${obd?.model ?? 'Teltonika'} · IMEI ${input.imei})` : 'Conexión Smartphone (sin equipo instalado)'
+        }.${phoneNote}`,
+      });
+      this.persist(this.state);
+      return { vehicle, device: obd };
+    }
+
     this.state.vehicles.unshift(vehicle);
     this.state.devices.unshift(device);
 
@@ -2539,7 +4135,7 @@ class FleetStore {
       type: MaintenanceRecord['type'];
       title: string;
       workshopOrTech: string;
-      costMxn: number;
+      cost: number;
       notes: string;
       nextServiceDate?: string;
       clearFaults?: boolean;
@@ -2579,7 +4175,7 @@ class FleetStore {
       odometerAtService: vehicle.odometerKm,
       nextServiceDate: resolvedDate,
       workshopOrTech: input.workshopOrTech.trim() || 'Taller Interno',
-      costMxn: Number(input.costMxn || 0),
+      cost: Number(input.cost || 0),
       notes: input.notes.trim(),
       status: 'completado',
     };
@@ -2655,6 +4251,28 @@ class FleetStore {
     return dev;
   }
 
+  /** Work order lines; a unit cost in another currency is converted to the company's. */
+  private normalizeOrderParts(
+    tenantId: string,
+    parts: Array<{ sku: string; name: string; category: WorkOrderPart['category']; quantity: number; unitCost: number; currency?: string }>,
+    dateIso: string
+  ): WorkOrderPart[] {
+    return parts.map((p, idx) => {
+      const qty = Math.max(1, Number(p.quantity || 1));
+      const cost = this.currency.toTenantAmount(tenantId, Math.max(0, Number(p.unitCost || 0)), p.currency, dateIso);
+      return {
+        id: `prt-${uid()}-${idx}`,
+        sku: (p.sku || `REF-${100 + idx}`).trim().toUpperCase(),
+        name: p.name.trim(),
+        category: p.category === 'insumo' || p.category === 'mano_obra' ? p.category : 'refaccion',
+        quantity: qty,
+        unitCost: cost.amount,
+        subtotal: Number((qty * cost.amount).toFixed(2)),
+        ...(cost.original ? { original: cost.original } : {}),
+      };
+    });
+  }
+
   createWorkOrder(
     tenantId: string,
     input: {
@@ -2665,8 +4283,9 @@ class FleetStore {
       title: string;
       workshopOrTech: string;
       scheduledDate: string;
-      parts: Array<{ sku: string; name: string; category: WorkOrderPart['category']; quantity: number; unitCostMxn: number }>;
-      laborCostMxn: number;
+      parts: Array<{ sku: string; name: string; category: WorkOrderPart['category']; quantity: number; unitCost: number; currency?: string }>;
+      laborCost: number;
+      laborCurrency?: string;
       notes: string;
       clearFaultsOnClose?: boolean;
     },
@@ -2680,22 +4299,12 @@ class FleetStore {
     );
     if (!vehicle) return null;
 
-    const normalizedParts: WorkOrderPart[] = (input.parts || []).map((p, idx) => {
-      const qty = Math.max(1, Number(p.quantity || 1));
-      const unitCost = Math.max(0, Number(p.unitCostMxn || 0));
-      return {
-        id: `prt-${uid()}-${idx}`,
-        sku: (p.sku || `REF-${100 + idx}`).trim().toUpperCase(),
-        name: p.name.trim(),
-        category: p.category === 'insumo' || p.category === 'mano_obra' ? p.category : 'refaccion',
-        quantity: qty,
-        unitCostMxn: unitCost,
-        subtotalMxn: Number((qty * unitCost).toFixed(2)),
-      };
-    });
-    const partsCostMxn = Number(normalizedParts.reduce((s, p) => s + p.subtotalMxn, 0).toFixed(2));
-    const laborCostMxn = Math.max(0, Number(input.laborCostMxn || 0));
-    const totalCostMxn = Number((partsCostMxn + laborCostMxn).toFixed(2));
+    const createdAt = new Date().toISOString();
+    const normalizedParts = this.normalizeOrderParts(vehicle.tenantId, input.parts || [], createdAt);
+    const partsCost = Number(normalizedParts.reduce((s, p) => s + p.subtotal, 0).toFixed(2));
+    const labor = this.currency.toTenantAmount(vehicle.tenantId, Math.max(0, Number(input.laborCost || 0)), input.laborCurrency, createdAt);
+    const laborCost = labor.amount;
+    const totalCost = Number((partsCost + laborCost).toFixed(2));
     const order: WorkOrder = {
       id: `OT-${vehicle.unitCode.split('-')[0]}-${uid()}`,
       tenantId: vehicle.tenantId,
@@ -2713,12 +4322,13 @@ class FleetStore {
       engineHoursAtOrder: vehicle.engineHours,
       odometerAtOrder: vehicle.odometerKm,
       parts: normalizedParts,
-      laborCostMxn,
-      partsCostMxn,
-      totalCostMxn,
+      laborCost,
+      ...(labor.original ? { laborOriginal: labor.original } : {}),
+      partsCost,
+      totalCost,
       notes: input.notes.trim(),
       clearFaultsOnClose: Boolean(input.clearFaultsOnClose ?? true),
-      createdAt: new Date().toISOString(),
+      createdAt,
     };
 
     this.state.workOrders.unshift(order);
@@ -2730,7 +4340,7 @@ class FleetStore {
       module: 'Mantenimiento',
       action: 'Apertura de orden de trabajo',
       targetLabel: `${order.id} · ${vehicle.unitCode}`,
-      detail: `${order.title} · Costo estimado $${order.totalCostMxn.toLocaleString('es-MX')} MXN.`,
+      detail: `${order.title} · Costo estimado ${this.money(order.tenantId, order.totalCost)}.`,
     });
     this.persist(this.state);
     return order;
@@ -2745,8 +4355,9 @@ class FleetStore {
       workshopOrTech?: string;
       scheduledDate?: string;
       notes?: string;
-      laborCostMxn?: number;
-      parts?: Array<{ sku: string; name: string; category: WorkOrderPart['category']; quantity: number; unitCostMxn: number }>;
+      laborCost?: number;
+      laborCurrency?: string;
+      parts?: Array<{ sku: string; name: string; category: WorkOrderPart['category']; quantity: number; unitCost: number; currency?: string }>;
       clearFaultsOnClose?: boolean;
       nextServiceDate?: string;
     },
@@ -2778,26 +4389,19 @@ class FleetStore {
     }
     if (typeof patch.notes === 'string') order.notes = patch.notes.trim();
     if (typeof patch.clearFaultsOnClose === 'boolean') order.clearFaultsOnClose = patch.clearFaultsOnClose;
+    // Amounts in another currency are converted with the rates of the order's date, so
+    // editing an order doesn't make its converted amounts drift.
     if (Array.isArray(patch.parts)) {
-      order.parts = patch.parts.map((p, idx) => {
-        const qty = Math.max(1, Number(p.quantity || 1));
-        const unitCost = Math.max(0, Number(p.unitCostMxn || 0));
-        return {
-          id: `prt-${uid()}-${idx}`,
-          sku: (p.sku || `REF-${100 + idx}`).trim().toUpperCase(),
-          name: p.name.trim(),
-          category: p.category === 'insumo' || p.category === 'mano_obra' ? p.category : 'refaccion',
-          quantity: qty,
-          unitCostMxn: unitCost,
-          subtotalMxn: Number((qty * unitCost).toFixed(2)),
-        };
-      });
-      order.partsCostMxn = Number(order.parts.reduce((s, p) => s + p.subtotalMxn, 0).toFixed(2));
+      order.parts = this.normalizeOrderParts(order.tenantId, patch.parts, order.createdAt);
+      order.partsCost = Number(order.parts.reduce((s, p) => s + p.subtotal, 0).toFixed(2));
     }
-    if (typeof patch.laborCostMxn === 'number') {
-      order.laborCostMxn = Math.max(0, Number(patch.laborCostMxn));
+    if (typeof patch.laborCost === 'number') {
+      const labor = this.currency.toTenantAmount(order.tenantId, Math.max(0, Number(patch.laborCost)), patch.laborCurrency, order.createdAt);
+      order.laborCost = labor.amount;
+      if (labor.original) order.laborOriginal = labor.original;
+      else delete order.laborOriginal;
     }
-    order.totalCostMxn = Number((order.partsCostMxn + order.laborCostMxn).toFixed(2));
+    order.totalCost = Number((order.partsCost + order.laborCost).toFixed(2));
 
     let updatedVehicle: Vehicle | undefined;
     let createdRecord: MaintenanceRecord | undefined;
@@ -2860,7 +4464,7 @@ class FleetStore {
           odometerAtService: veh.odometerKm,
           nextServiceDate: resolvedDate,
           workshopOrTech: order.workshopOrTech,
-          costMxn: order.totalCostMxn,
+          cost: order.totalCost,
           notes: order.notes || 'Orden de trabajo cerrada en taller.',
           status: 'completado',
         };
@@ -2889,7 +4493,7 @@ class FleetStore {
       module: 'Mantenimiento',
       action: `Orden ${order.status}`,
       targetLabel: `${order.id} · ${order.unitCode}`,
-      detail: `Prioridad ${order.priority.toUpperCase()} · Estado ${order.status} · Total $${order.totalCostMxn.toLocaleString('es-MX')} MXN.`,
+      detail: `Prioridad ${order.priority.toUpperCase()} · Estado ${order.status} · Total ${this.money(order.tenantId, order.totalCost)}.`,
     });
     this.persist(this.state);
     return { workOrder: order, vehicle: updatedVehicle, record: createdRecord, lowStockAlerts };
@@ -2903,7 +4507,7 @@ class FleetStore {
       intervalHours: number;
       intervalKm: number;
       intervalDays: number;
-      estimatedCostMxn: number;
+      estimatedCost: number;
       checklistFocus: string;
     },
     actorName: string,
@@ -2919,7 +4523,7 @@ class FleetStore {
       intervalHours: Math.max(25, Number(input.intervalHours || 250)),
       intervalKm: Math.max(500, Number(input.intervalKm || 10000)),
       intervalDays: Math.max(7, Number(input.intervalDays || 45)),
-      estimatedCostMxn: Math.max(0, Number(input.estimatedCostMxn || 0)),
+      estimatedCost: Math.max(0, Number(input.estimatedCost || 0)),
       checklistFocus: input.checklistFocus.trim(),
       active: true,
       updatedAt: new Date().toISOString(),
@@ -3024,11 +4628,11 @@ class FleetStore {
       name: item.name,
       category: item.category,
       quantity: 1,
-      unitCostMxn: item.unitCostMxn,
-      subtotalMxn: item.unitCostMxn,
+      unitCost: item.unitCost,
+      subtotal: item.unitCost,
     }));
-    const partsCostMxn = Number(selectedParts.reduce((s, p) => s + p.subtotalMxn, 0).toFixed(2));
-    const laborCostMxn = Math.max(1200, Math.round(plan.estimatedCostMxn * 0.45));
+    const partsCost = Number(selectedParts.reduce((s, p) => s + p.subtotal, 0).toFixed(2));
+    const laborCost = Math.max(1200, Math.round(plan.estimatedCost * 0.45));
 
     const order: WorkOrder = {
       id: `OT-AUTO-${vehicle.unitCode.split('-')[0]}-${uid()}`,
@@ -3047,9 +4651,9 @@ class FleetStore {
       engineHoursAtOrder: vehicle.engineHours,
       odometerAtOrder: vehicle.odometerKm,
       parts: selectedParts,
-      laborCostMxn,
-      partsCostMxn,
-      totalCostMxn: Number((partsCostMxn + laborCostMxn).toFixed(2)),
+      laborCost,
+      partsCost,
+      totalCost: Number((partsCost + laborCost).toFixed(2)),
       notes: `OT automática por umbral (${remHours} h / ${remKm.toLocaleString('es-MX')} km / fecha ${vehicle.nextServiceDate}). Plan: ${plan.checklistFocus}`,
       clearFaultsOnClose: true,
       autoGenerated: true,
@@ -3079,7 +4683,7 @@ class FleetStore {
       intervalHours: number;
       intervalKm: number;
       intervalDays: number;
-      estimatedCostMxn: number;
+      estimatedCost: number;
       checklistFocus: string;
       active: boolean;
     }>,
@@ -3100,8 +4704,8 @@ class FleetStore {
     if (typeof patch.intervalHours === 'number') plan.intervalHours = Math.max(25, Number(patch.intervalHours));
     if (typeof patch.intervalKm === 'number') plan.intervalKm = Math.max(500, Number(patch.intervalKm));
     if (typeof patch.intervalDays === 'number') plan.intervalDays = Math.max(7, Number(patch.intervalDays));
-    if (typeof patch.estimatedCostMxn === 'number') {
-      plan.estimatedCostMxn = Math.max(0, Number(patch.estimatedCostMxn));
+    if (typeof patch.estimatedCost === 'number') {
+      plan.estimatedCost = Math.max(0, Number(patch.estimatedCost));
     }
     if (typeof patch.checklistFocus === 'string') plan.checklistFocus = patch.checklistFocus.trim();
     if (typeof patch.active === 'boolean') plan.active = patch.active;
@@ -3215,7 +4819,8 @@ class FleetStore {
       unit: string;
       stockQty: number;
       minStock: number;
-      unitCostMxn: number;
+      unitCost: number;
+      unitCostCurrency?: string;
       warehouseLocation: string;
     },
     actorName: string,
@@ -3223,6 +4828,7 @@ class FleetStore {
     actorHidden = false
   ): PartInventoryItem {
     const resolvedTenantId = this.requireTenant(tenantId);
+    const cost = this.currency.toTenantAmount(resolvedTenantId, Math.max(0, Number(input.unitCost || 0)), input.unitCostCurrency);
     const normalizedSku = input.sku.trim().toUpperCase();
     const existing = this.state.partsInventory.find(
       (i) => i.tenantId === resolvedTenantId && i.sku.toUpperCase() === normalizedSku
@@ -3235,7 +4841,9 @@ class FleetStore {
       existing.unit = input.unit.trim() || existing.unit;
       existing.stockQty = Math.max(0, Number(input.stockQty));
       existing.minStock = Math.max(0, Number(input.minStock));
-      existing.unitCostMxn = Math.max(0, Number(input.unitCostMxn));
+      existing.unitCost = cost.amount;
+      if (cost.original) existing.unitCostOriginal = cost.original;
+      else delete existing.unitCostOriginal;
       existing.warehouseLocation = input.warehouseLocation.trim() || existing.warehouseLocation;
       existing.updatedAt = nowIso;
       this.addAuditLog({
@@ -3246,7 +4854,7 @@ class FleetStore {
         module: 'Almacén y Refacciones',
         action: 'Actualización de SKU',
         targetLabel: `${existing.sku} · ${existing.name}`,
-        detail: `Existencia ${existing.stockQty} ${existing.unit} (mín ${existing.minStock}) · $${existing.unitCostMxn} MXN.`,
+        detail: `Existencia ${existing.stockQty} ${existing.unit} (mín ${existing.minStock}) · ${this.money(existing.tenantId, existing.unitCost)}.`,
       });
       this.persist(this.state);
       return existing;
@@ -3261,7 +4869,8 @@ class FleetStore {
       unit: input.unit.trim() || 'pza',
       stockQty: Math.max(0, Number(input.stockQty || 0)),
       minStock: Math.max(0, Number(input.minStock || 1)),
-      unitCostMxn: Math.max(0, Number(input.unitCostMxn || 0)),
+      unitCost: cost.amount,
+      ...(cost.original ? { unitCostOriginal: cost.original } : {}),
       warehouseLocation: input.warehouseLocation.trim() || 'Almacén Central',
       updatedAt: nowIso,
     };
@@ -3349,7 +4958,7 @@ class FleetStore {
           workshopOrTech: 'Taller Central Certificado',
           scheduledDate: new Date().toISOString().slice(0, 10),
           parts: [],
-          laborCostMxn: 1400,
+          laborCost: 1400,
           notes: input.summaryNote || `Hallazgos en checklist turno ${input.shift}.`,
           clearFaultsOnClose: false,
         },
@@ -3875,9 +5484,19 @@ class FleetStore {
       targetScope === 'all'
         ? this.state.vehicles
         : this.state.vehicles.filter((v) => v.tenantId === targetScope);
+    const simulate = process.env.SIMULATED_TELEMETRY !== 'false';
+    const realDevices = new Set(
+      this.state.devices.filter((d) => d.telemetrySource === 'traccar').map((d) => d.vehicleId)
+    );
+    // Units moved by a driver's phone in the last 10 minutes keep their real position too.
+    const phoneCutoff = Date.now() - 10 * 60_000;
+    for (const v of this.state.vehicles) {
+      if (v.positionSource === 'smartphone' && Date.parse(v.lastReportAt) > phoneCutoff) realDevices.add(v.id);
+    }
     for (let i = 0; i < list.length; i++) {
       const v = list[i];
-      if (v.operationalStatus === 'en_ruta' || v.operationalStatus === 'alerta') {
+      // Units reporting through Traccar keep their real position; simulation only moves demo units.
+      if (simulate && !realDevices.has(v.id) && (v.operationalStatus === 'en_ruta' || v.operationalStatus === 'alerta')) {
         const rad = (v.heading * Math.PI) / 180;
         const delta = v.assetType === 'maquinaria_pesada' ? 0.00025 : 0.0018;
         v.lat = Number((v.lat + Math.cos(rad) * delta).toFixed(5));

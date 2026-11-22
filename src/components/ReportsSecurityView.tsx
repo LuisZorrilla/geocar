@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Download, FileSpreadsheet, History, Plus, Shield, UserPlus, Users } from 'lucide-react';
+import { FileSpreadsheet, History, Plus, Shield, UserPlus, Users } from 'lucide-react';
 import type {
   AlertEvent,
   AuditLog,
@@ -12,8 +12,9 @@ import type {
   Vehicle,
   VideoClip,
 } from '../shared/types.ts';
-import { downloadWithAuth, formatTimeClock, PERMISSION_LABELS } from '../lib/api.ts';
+import { formatTimeClock, PERMISSION_LABELS } from '../lib/api.ts';
 import { Pagination, usePagination } from './Pagination.tsx';
+import { ExportMenu } from './ExportMenu.tsx';
 
 interface ReportsSecurityViewProps {
   tenant: Tenant;
@@ -118,12 +119,6 @@ export function ReportsSecurityView({
       : 100;
   const maintAlertCount = vehicles.filter((v) => v.maintenanceStatus !== 'al_dia').length;
 
-  const handleExportCsv = () => {
-    downloadWithAuth('/api/reports/export', 'flota_mantenimiento.csv').catch((err) =>
-      window.alert(err instanceof Error ? err.message : 'No se pudo descargar el reporte.')
-    );
-  };
-
   const handleCreateRoleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSecError(null);
@@ -196,14 +191,7 @@ export function ReportsSecurityView({
               Información exclusiva de tu empresa · {tenant.city} · Retención de video: {tenant.retentionDays} días
             </p>
           </div>
-          <button
-            type="button"
-            onClick={handleExportCsv}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-medium bg-sky-600 hover:bg-sky-500 text-white transition-colors cursor-pointer whitespace-nowrap"
-          >
-            <Download className="w-3.5 h-3.5" />
-            Exportar reporte flota (CSV)
-          </button>
+          <ExportMenu url="/api/reports/export" label="Exportar reporte de flota" count={vehicles.length} fileName="flota" />
         </div>
 
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 pt-2">

@@ -1,5 +1,5 @@
 import type { PoolClient } from 'pg';
-import type { FleetStoreState, RoleDefinition, Tenant, UserAccount } from '../../src/shared/types.ts';
+import type { FleetStoreState, ObdFaultEvent, ObdHistoryPoint, RoleDefinition, Tenant, UserAccount } from '../../src/shared/types.ts';
 import { getPool } from './pool.ts';
 
 /**
@@ -54,6 +54,12 @@ const tenantsTable: TableDef<Tenant> = {
     { name: 'retention_days', type: 'integer' },
     { name: 'plan_tier', type: 'text' },
     { name: 'status', type: 'text' },
+    { name: 'contact_name', type: 'text' },
+    { name: 'contact_email', type: 'text' },
+    { name: 'contact_phone', type: 'text' },
+    { name: 'created_at', type: 'timestamptz' },
+    { name: 'currency', type: 'text' },
+    { name: 'reference_currency', type: 'text' },
   ],
   toRow: (t) => ({
     id: t.id,
@@ -65,6 +71,12 @@ const tenantsTable: TableDef<Tenant> = {
     retention_days: t.retentionDays,
     plan_tier: t.planTier,
     status: t.status,
+    contact_name: t.contactName ?? null,
+    contact_email: t.contactEmail ?? null,
+    contact_phone: t.contactPhone ?? null,
+    created_at: t.createdAt ?? null,
+    currency: t.currency ?? null,
+    reference_currency: t.referenceCurrency ?? 'USD',
   }),
   fromRow: (r) => ({
     id: r.id,
@@ -76,6 +88,12 @@ const tenantsTable: TableDef<Tenant> = {
     retentionDays: r.retention_days,
     planTier: r.plan_tier,
     status: r.status,
+    ...(r.contact_name ? { contactName: r.contact_name } : {}),
+    ...(r.contact_email ? { contactEmail: r.contact_email } : {}),
+    ...(r.contact_phone ? { contactPhone: r.contact_phone } : {}),
+    ...(r.created_at ? { createdAt: toIso(r.created_at)! } : {}),
+    currency: r.currency ?? null,
+    referenceCurrency: r.reference_currency ?? 'USD',
   }),
 };
 
@@ -124,6 +142,7 @@ const usersTable: TableDef<UserAccount> = {
     { name: 'failed_attempts', type: 'integer' },
     { name: 'locked_until', type: 'timestamptz' },
     { name: 'created_at', type: 'timestamptz' },
+    { name: 'must_change_password', type: 'boolean' },
   ],
   toRow: (u) => ({
     id: u.id,
@@ -138,6 +157,7 @@ const usersTable: TableDef<UserAccount> = {
     failed_attempts: u.failedAttempts ?? 0,
     locked_until: u.lockedUntil ?? null,
     created_at: u.createdAt,
+    must_change_password: Boolean(u.mustChangePassword),
   }),
   fromRow: (r) => ({
     id: r.id,
@@ -152,11 +172,14 @@ const usersTable: TableDef<UserAccount> = {
     failedAttempts: r.failed_attempts,
     lockedUntil: toIso(r.locked_until),
     createdAt: toIso(r.created_at) ?? new Date().toISOString(),
+    mustChangePassword: Boolean(r.must_change_password),
   }),
 };
 
 /** Order matters: parents before children on upsert, reverse on delete. */
 const TABLES: TableDef[] = [
+  documentTable('currencies', 'currencies'),
+  documentTable('exchangeRates', 'exchange_rates'),
   tenantsTable,
   rolesTable,
   usersTable,
@@ -174,9 +197,10 @@ const TABLES: TableDef[] = [
   documentTable('incidents', 'incidents'),
   documentTable('videoClips', 'video_clips'),
   documentTable('auditLogs', 'audit_logs'),
+  documentTable('currencyChanges', 'currency_changes'),
 ];
 
-export const ALL_TABLES = [...TABLES.map((t) => t.table), 'app_settings', 'sessions'];
+export const ALL_TABLES = [...TABLES.map((t) => t.table), 'app_settings', 'sessions', 'driver_files', 'obd_samples', 'obd_fault_events'];
 
 export interface StoredSession {
   tokenHash: string;
@@ -365,5 +389,157 @@ export class StateRepository {
 
   async deleteSessionsForUser(userId: string): Promise<void> {
     await getPool().query('DELETE FROM sessions WHERE user_id = $1', [userId]);
+  }
+
+  // ---- Driver document files (kept out of the in-memory state) -------------
+
+  /** Stores the file for a driver document, replacing any previous one. */
+  async saveDriverFile(f: {
+    id: string;
+    tenantId: string;
+    driverId: string;
+    docType: string;
+    name: string;
+    mime: string;
+    size: number;
+    sha256: string;
+    data: Buffer;
+    uploadedBy: string;
+  }): Promise<void> {
+    await getPool().query(
+      `INSERT INTO driver_files (id, tenant_id, driver_id, doc_type, name, mime, size, sha256, data, uploaded_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (driver_id, doc_type) DO UPDATE SET
+         id = EXCLUDED.id, tenant_id = EXCLUDED.tenant_id, name = EXCLUDED.name, mime = EXCLUDED.mime,
+         size = EXCLUDED.size, sha256 = EXCLUDED.sha256, data = EXCLUDED.data,
+         uploaded_by = EXCLUDED.uploaded_by, created_at = now()`,
+      [f.id, f.tenantId, f.driverId, f.docType, f.name, f.mime, f.size, f.sha256, f.data, f.uploadedBy]
+    );
+  }
+
+  async getDriverFile(
+    tenantId: string,
+    driverId: string,
+    docType: string
+  ): Promise<{ name: string; mime: string; data: Buffer } | null> {
+    const { rows } = await getPool().query(
+      'SELECT name, mime, data FROM driver_files WHERE tenant_id = $1 AND driver_id = $2 AND doc_type = $3',
+      [tenantId, driverId, docType]
+    );
+    return rows[0] ? { name: rows[0].name, mime: rows[0].mime, data: rows[0].data } : null;
+  }
+
+  async deleteDriverFile(tenantId: string, driverId: string, docType: string): Promise<void> {
+    await getPool().query('DELETE FROM driver_files WHERE tenant_id = $1 AND driver_id = $2 AND doc_type = $3', [
+      tenantId,
+      driverId,
+      docType,
+    ]);
+  }
+
+  // ---- Global settings (single keys in app_settings) -------------------------
+
+  async getAppSetting<T>(key: string): Promise<T | null> {
+    const { rows } = await getPool().query('SELECT data FROM app_settings WHERE key = $1', [key]);
+    return (rows[0]?.data as T) ?? null;
+  }
+
+  /** Stores a setting; null deletes it. */
+  async setAppSetting(key: string, data: unknown | null): Promise<void> {
+    if (data === null) {
+      await getPool().query('DELETE FROM app_settings WHERE key = $1', [key]);
+      return;
+    }
+    await getPool().query(
+      `INSERT INTO app_settings (key, data) VALUES ($1, $2::jsonb)
+       ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
+      [key, JSON.stringify(data)]
+    );
+  }
+
+  // ---- OBD-II history (time series, kept out of the in-memory state) -------
+
+  async insertObdSample(x: {
+    tenantId: string;
+    vehicleId: string;
+    at: string;
+    rpm?: number;
+    coolantC?: number;
+    fuelPct?: number;
+    batteryV?: number;
+    odometerKm?: number;
+    speedKmh?: number;
+  }): Promise<void> {
+    await getPool().query(
+      `INSERT INTO obd_samples (tenant_id, vehicle_id, at, rpm, coolant_c, fuel_pct, battery_v, odometer_km, speed_kmh)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [x.tenantId, x.vehicleId, x.at, x.rpm ?? null, x.coolantC ?? null, x.fuelPct ?? null, x.batteryV ?? null, x.odometerKm ?? null, x.speedKmh ?? null]
+    );
+  }
+
+  /** Averages per bucket (plus max temperature / min battery) between from and now. */
+  async obdHistory(tenantId: string, vehicleId: string, fromIso: string, bucketSeconds: number): Promise<ObdHistoryPoint[]> {
+    const { rows } = await getPool().query(
+      `SELECT date_bin(make_interval(secs => $4), at, TIMESTAMPTZ '2000-01-01') AS bucket,
+              avg(rpm) AS rpm, avg(coolant_c) AS coolant, avg(fuel_pct) AS fuel, avg(battery_v) AS battery,
+              avg(speed_kmh) AS speed, max(coolant_c) AS coolant_max, min(battery_v) AS battery_min
+         FROM obd_samples
+        WHERE tenant_id = $1 AND vehicle_id = $2 AND at >= $3
+        GROUP BY bucket
+        ORDER BY bucket`,
+      [tenantId, vehicleId, fromIso, bucketSeconds]
+    );
+    const num = (x: unknown, digits = 1) => (x == null ? null : Number(Number(x).toFixed(digits)));
+    return rows.map((r: any) => ({
+      at: new Date(r.bucket).toISOString(),
+      rpm: num(r.rpm, 0),
+      coolantC: num(r.coolant),
+      fuelPct: num(r.fuel),
+      batteryV: num(r.battery, 2),
+      speedKmh: num(r.speed),
+      coolantMaxC: num(r.coolant_max),
+      batteryMinV: num(r.battery_min, 2),
+    }));
+  }
+
+  async purgeObdSamples(olderThanIso: string): Promise<number> {
+    const res = await getPool().query('DELETE FROM obd_samples WHERE at < $1', [olderThanIso]);
+    return res.rowCount ?? 0;
+  }
+
+  async openObdFault(e: Omit<ObdFaultEvent, 'clearedAt'> & { tenantId: string }): Promise<void> {
+    await getPool().query(
+      `INSERT INTO obd_fault_events (id, tenant_id, vehicle_id, code, description, severity, system, opened_at, work_order_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [e.id, e.tenantId, e.vehicleId, e.code, e.description, e.severity, e.system, e.openedAt, e.workOrderId]
+    );
+  }
+
+  /** Closes the open event of that unit and code. */
+  async clearObdFault(vehicleId: string, code: string, clearedAt: string): Promise<void> {
+    await getPool().query(
+      'UPDATE obd_fault_events SET cleared_at = $3 WHERE vehicle_id = $1 AND code = $2 AND cleared_at IS NULL',
+      [vehicleId, code, clearedAt]
+    );
+  }
+
+  async listObdFaults(tenantId: string, vehicleId: string, limit = 100): Promise<ObdFaultEvent[]> {
+    const { rows } = await getPool().query(
+      `SELECT id, vehicle_id, code, description, severity, system, opened_at, cleared_at, work_order_id
+         FROM obd_fault_events WHERE tenant_id = $1 AND vehicle_id = $2
+        ORDER BY opened_at DESC LIMIT $3`,
+      [tenantId, vehicleId, limit]
+    );
+    return rows.map((r: any) => ({
+      id: r.id,
+      vehicleId: r.vehicle_id,
+      code: r.code,
+      description: r.description,
+      severity: r.severity,
+      system: r.system,
+      openedAt: new Date(r.opened_at).toISOString(),
+      clearedAt: r.cleared_at ? new Date(r.cleared_at).toISOString() : null,
+      workOrderId: r.work_order_id,
+    }));
   }
 }

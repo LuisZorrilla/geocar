@@ -45,7 +45,7 @@ export function LoginView({ onLoginSuccess }: LoginViewProps) {
           <div className="space-y-6">
             <div>
               <div className="text-xs font-medium text-sky-400">Acceso BackOffice Multiempresa</div>
-              <h1 className="text-2xl font-bold text-slate-100 mt-1">Vigilant FleetOps</h1>
+              <h1 className="text-2xl font-bold text-slate-100 mt-1">Vigilant GeoCar</h1>
               <p className="text-xs text-slate-400 mt-1.5 leading-relaxed">
                 Cada empresa accede exclusivamente a su flota, maquinaria pesada, mantenimiento, telemetría Esri y evidencia de video JT1078.
               </p>

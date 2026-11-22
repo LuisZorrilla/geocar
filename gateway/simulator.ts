@@ -4,6 +4,7 @@
  *
  *   npm run gateway:sim                       # 2013, localhost:7611
  *   npm run gateway:sim -- --v2019 --host 1.2.3.4 --port 7611
+ *   npm run gateway:sim -- --port 5015 --phone 201051000173   # act as a given terminal against Traccar
  */
 import net from 'net';
 import path from 'path';
@@ -25,14 +26,14 @@ export interface SimulationResult {
   steps: Array<{ step: string; ok: boolean; detail: string }>;
 }
 
-/** Route along Av. Constitución, Monterrey (west → east). */
+/** Route along Av. Libertador General San Martín, San Juan (west → east). */
 const ROUTE = [
-  [25.6714, -100.3332],
-  [25.6702, -100.3268],
-  [25.6690, -100.3196],
-  [25.6687, -100.3121],
-  [25.6693, -100.3049],
-  [25.6705, -100.2978],
+  [-31.5352, -68.5720],
+  [-31.5357, -68.5640],
+  [-31.5362, -68.5560],
+  [-31.5367, -68.5480],
+  [-31.5372, -68.5400],
+  [-31.5375, -68.5330],
 ];
 
 export async function simulate(opts: SimulationOptions): Promise<SimulationResult> {
@@ -96,7 +97,7 @@ export async function simulate(opts: SimulationOptions): Promise<SimulationResul
   const regSerial = send(
     MSG.REGISTER,
     buildRegisterBody(
-      { provinceId: 19, cityId: 39, manufacturerId: 'HOWEN', terminalModel: 'HERO-ME40-04', terminalId: 'SIM0001', plateColor: 1, plate: 'NL-123-SIM' },
+      { provinceId: 19, cityId: 39, manufacturerId: 'HOWEN', terminalModel: 'HERO-ME40-04', terminalId: 'SIM0001', plateColor: 1, plate: 'AB123SJ' },
       opts.version
     )
   );
@@ -126,6 +127,9 @@ export async function simulate(opts: SimulationOptions): Promise<SimulationResul
   for (let i = 0; i < total; i++) {
     const [lat, lng] = ROUTE[i % ROUTE.length];
     const body = buildLocationBody({
+      // Realistic GPS times: one fix every 10 s, the last one "now". A real camera never reports
+      // several positions in the same second, and the platform orders positions by this time.
+      time: new Date(Date.now() - (total - 1 - i) * 10_000),
       latitude: lat,
       longitude: lng,
       speedKmh: 40 + i * 5.5,
@@ -157,6 +161,7 @@ if (isMain) {
     port: Number(arg('--port') ?? process.env.JT808_PORT ?? 7611),
     version: args.includes('--v2019') ? '2019' : '2013',
     positions: Number(arg('--positions') ?? 5),
+    phone: arg('--phone'),
   })
     .then((r) => {
       console.log(r.ok ? '\nSimulación completa: todas las respuestas OK.' : '\nSimulación con errores.');

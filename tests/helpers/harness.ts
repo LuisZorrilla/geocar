@@ -67,6 +67,8 @@ export class TestEnv {
   private appPort = 0;
   seedLog = '';
 
+  constructor(private readonly extraEnv: NodeJS.ProcessEnv = {}) {}
+
   get baseUrl(): string {
     return `http://127.0.0.1:${this.appPort}`;
   }
@@ -87,6 +89,15 @@ export class TestEnv {
       PG_POOL_MAX: '1',
       NODE_ENV: 'test',
       VITE_CONFIG_NATIVE_IGNORE_WARNING: 'true',
+      INGEST_TOKEN: INGEST_TOKEN,
+      DEVICE_SERVER_HOST: 'flota.test.local',
+      // The developer's .env must not leak into tests (dotenv never overrides set variables).
+      SIMULATED_TELEMETRY: 'true',
+      // Never reach the developer's real Traccar from tests.
+      TRACCAR_WEB_URL: '',
+      TRACCAR_ADMIN_EMAIL: '',
+      TRACCAR_ADMIN_PASSWORD: '',
+      ...this.extraEnv,
     });
     this.seedLog = await waitForLine(this.app, /listening on/);
   }
@@ -134,6 +145,8 @@ export class TestEnv {
     return res.json.token;
   }
 }
+
+export const INGEST_TOKEN = 'test-ingest-token-0123456789';
 
 export const DEMO = {
   superadmin: ['superadmin', 'SuperAdmin2026!'],

@@ -43,13 +43,58 @@ import {
 } from '../lib/api.ts';
 import { Pagination, usePagination } from './Pagination.tsx';
 import { MaintenanceDashboardView } from './MaintenanceDashboardView.tsx';
+import { ExportMenu } from './ExportMenu.tsx';
+import { Money, useMoney } from '../lib/money.tsx';
+
+/** Currency of an amount: empty = the company's; any other enabled currency is converted on the server. */
+function CurrencySelect({
+  value,
+  companyCode,
+  onChange,
+  className,
+}: {
+  value: string;
+  companyCode: string | null;
+  onChange: (code: string) => void;
+  className?: string;
+}) {
+  const money = useMoney();
+  return (
+    <select value={value} onChange={(e) => onChange(e.target.value)} className={className} aria-label="Moneda del importe" title="Moneda del importe">
+      <option value="">{companyCode ?? 'Empresa'}</option>
+      {money.enabled
+        .filter((c) => c.code !== companyCode)
+        .map((c) => (
+          <option key={c.code} value={c.code}>
+            {c.code}
+          </option>
+        ))}
+    </select>
+  );
+}
+
+/** "= $ 160.000,00 ARS al TC del 22/11 (manual)" under an amount loaded in another currency. */
+function ConversionHint({ amount, from, to, date }: { amount: number; from: string; to: string | null; date?: string }) {
+  const money = useMoney();
+  if (!from || from === to) return null;
+  if (!to) return <p className="mt-1 text-[11px] text-amber-300">La empresa no tiene moneda definida: no se puede convertir.</p>;
+  const f = money.factor(from, to, date);
+  if (f === null) return <p className="mt-1 text-[11px] text-rose-300">Falta el tipo de cambio {from}/{to}: el superadmin debe cargarlo en «Monedas».</p>;
+  return (
+    <p className="mt-1 text-[11px] text-amber-300">
+      = {money.fmtIn(amount * f, to, { withCode: true })} al tipo de cambio {date ? 'de la fecha de la orden' : 'vigente'} (1 {from} = {Number(f.toPrecision(6))} {to})
+    </p>
+  );
+}
 
 interface PartDraft {
   sku: string;
   name: string;
   category: WorkOrderPartCategory;
   quantity: number;
-  unitCostMxn: number;
+  unitCost: number;
+  /** Currency of unitCost when it isn't the company's (the server converts it). */
+  currency?: string;
 }
 
 interface MaintenanceWorkbenchProps {
@@ -71,7 +116,8 @@ interface MaintenanceWorkbenchProps {
     workshopOrTech: string;
     scheduledDate: string;
     parts: PartDraft[];
-    laborCostMxn: number;
+    laborCost: number;
+    laborCurrency?: string;
     notes: string;
     clearFaultsOnClose?: boolean;
   }) => Promise<void>;
@@ -83,7 +129,8 @@ interface MaintenanceWorkbenchProps {
       workshopOrTech?: string;
       scheduledDate?: string;
       notes?: string;
-      laborCostMxn?: number;
+      laborCost?: number;
+      laborCurrency?: string;
       parts?: PartDraft[];
       clearFaultsOnClose?: boolean;
       nextServiceDate?: string;
@@ -95,7 +142,7 @@ interface MaintenanceWorkbenchProps {
     intervalHours: number;
     intervalKm: number;
     intervalDays: number;
-    estimatedCostMxn: number;
+    estimatedCost: number;
     checklistFocus: string;
   }) => Promise<void>;
   onUpdatePreventivePlan: (
@@ -106,7 +153,7 @@ interface MaintenanceWorkbenchProps {
       intervalHours?: number;
       intervalKm?: number;
       intervalDays?: number;
-      estimatedCostMxn?: number;
+      estimatedCost?: number;
       checklistFocus?: string;
     }
   ) => Promise<void>;
@@ -120,7 +167,8 @@ interface MaintenanceWorkbenchProps {
     unit: string;
     stockQty: number;
     minStock: number;
-    unitCostMxn: number;
+    unitCost: number;
+    unitCostCurrency?: string;
     warehouseLocation: string;
   }) => Promise<void>;
   onAdjustPartStock: (itemId: string, deltaQty: number, reason: string) => Promise<void>;
@@ -166,6 +214,15 @@ export function MaintenanceWorkbench({
   onCreateChecklist,
   onOpenDossier,
 }: MaintenanceWorkbenchProps) {
+  const money = useMoney();
+  /** Amount in `from` → the company's currency (estimate with the latest rate; NaN when a rate is missing). */
+  const toCompany = (amount: number, from: string | undefined, companyCur: string | null, dateIso?: string) => {
+    if (!from || from === companyCur) return amount;
+    if (!companyCur) return NaN;
+    const f = money.factor(from, companyCur, dateIso);
+    return f === null ? NaN : amount * f;
+  };
+  const showAmount = (n: number, cur: string | null) => (Number.isNaN(n) ? 'sin TC' : money.fmtIn(n, cur));
   const [tab, setTab] = useState<MaintSubTab>('dashboard');
   const [statusFilter, setStatusFilter] = useState<'all' | WorkOrderStatus>('all');
   const [priorityFilter, setPriorityFilter] = useState<'all' | WorkOrderPriority>('all');
@@ -181,7 +238,8 @@ export function MaintenanceWorkbench({
     title: 'Servicio preventivo programado · Cambio de aceite y filtros',
     workshopOrTech: 'Taller Central Certificado',
     scheduledDate: new Date().toISOString().slice(0, 10),
-    laborCostMxn: 1850,
+    laborCost: 1850,
+    laborCurrency: '',
     notes: '',
     clearFaultsOnClose: true,
   });
@@ -191,7 +249,7 @@ export function MaintenanceWorkbench({
       name: 'Aceite Diésel Sintético 15W-40 (19L)',
       category: 'insumo',
       quantity: 1,
-      unitCostMxn: 2650,
+      unitCost: 2650,
     },
   ]);
   const [selectedInvSkuNew, setSelectedInvSkuNew] = useState('');
@@ -200,7 +258,7 @@ export function MaintenanceWorkbench({
     name: '',
     category: 'refaccion',
     quantity: 1,
-    unitCostMxn: 850,
+    unitCost: 850,
   });
   const [savingOrder, setSavingOrder] = useState(false);
 
@@ -209,7 +267,8 @@ export function MaintenanceWorkbench({
     priority: WorkOrderPriority;
     workshopOrTech: string;
     scheduledDate: string;
-    laborCostMxn: number;
+    laborCost: number;
+    laborCurrency: string;
     notes: string;
     nextServiceDate: string;
     clearFaultsOnClose: boolean;
@@ -221,7 +280,7 @@ export function MaintenanceWorkbench({
     name: '',
     category: 'refaccion',
     quantity: 1,
-    unitCostMxn: 750,
+    unitCost: 750,
   });
   const [updatingOrderId, setUpdatingOrderId] = useState<string | null>(null);
 
@@ -233,7 +292,7 @@ export function MaintenanceWorkbench({
     intervalHours: 250,
     intervalKm: 10000,
     intervalDays: 45,
-    estimatedCostMxn: 6500,
+    estimatedCost: 6500,
     checklistFocus: '',
   });
   const [savingPlan, setSavingPlan] = useState(false);
@@ -245,7 +304,7 @@ export function MaintenanceWorkbench({
     intervalHours: 250,
     intervalKm: 10000,
     intervalDays: 45,
-    estimatedCostMxn: 6500,
+    estimatedCost: 6500,
     checklistFocus: '',
   });
   const [assigningPlanId, setAssigningPlanId] = useState<string | null>(null);
@@ -262,7 +321,8 @@ export function MaintenanceWorkbench({
     unit: 'pza',
     stockQty: 8,
     minStock: 3,
-    unitCostMxn: 950,
+    unitCost: 950,
+    unitCostCurrency: '',
     warehouseLocation: 'Almacén Central · Rack B2',
   });
   const [savingInv, setSavingInv] = useState(false);
@@ -352,7 +412,8 @@ export function MaintenanceWorkbench({
       priority: selectedOrder.priority,
       workshopOrTech: selectedOrder.workshopOrTech,
       scheduledDate: selectedOrder.scheduledDate,
-      laborCostMxn: selectedOrder.laborCostMxn,
+      laborCost: selectedOrder.laborOriginal?.amount ?? selectedOrder.laborCost,
+      laborCurrency: selectedOrder.laborOriginal?.currency ?? '',
       notes: selectedOrder.notes,
       nextServiceDate: '',
       clearFaultsOnClose: Boolean(selectedOrder.clearFaultsOnClose),
@@ -361,7 +422,8 @@ export function MaintenanceWorkbench({
         name: p.name,
         category: p.category,
         quantity: p.quantity,
-        unitCostMxn: p.unitCostMxn,
+        unitCost: p.original?.amount ?? p.unitCost,
+        ...(p.original ? { currency: p.original.currency } : {}),
       })),
     });
   }, [
@@ -369,27 +431,30 @@ export function MaintenanceWorkbench({
     selectedOrder?.status,
     selectedOrder?.priority,
     selectedOrder?.parts.length,
-    selectedOrder?.totalCostMxn,
+    selectedOrder?.totalCost,
   ]);
 
   const activeOrdersCount = workOrders.filter(
     (w) => w.status === 'abierta' || w.status === 'en_taller' || w.status === 'esperando_refacciones'
   ).length;
-  const totalWorkOrdersMxn = workOrders
+  // Global view: each company's amounts converted to the scope currency (orders without a rate are left out).
+  const totalWorkOrders = workOrders
     .filter((w) => w.status !== 'cancelada')
-    .reduce((sum, w) => sum + w.totalCostMxn, 0);
+    .reduce((sum, w) => sum + w.totalCost * (money.toScope(w.tenantId, w.completedAt || w.createdAt) ?? 0), 0);
   const flaggedChecklistsCount = checklists.filter((c) => c.result !== 'aprobado').length;
   const lowStockItems = useMemo(
     () => partsInventory.filter((i) => i.stockQty <= i.minStock),
     [partsInventory]
   );
-  const totalInventoryValueMxn = useMemo(
-    () => partsInventory.reduce((s, i) => s + i.stockQty * i.unitCostMxn, 0),
-    [partsInventory]
+  const totalInventoryValue = useMemo(
+    () => partsInventory.reduce((s, i) => s + i.stockQty * i.unitCost * (money.toScope(i.tenantId) ?? 0), 0),
+    [partsInventory, money]
   );
 
-  const draftPartsTotal = partDrafts.reduce((s, p) => s + p.quantity * p.unitCostMxn, 0);
-  const draftGrandTotal = draftPartsTotal + Number(orderForm.laborCostMxn || 0);
+  const orderVehicle = vehicles.find((v) => v.id === orderForm.vehicleId);
+  const draftCur = money.currencyOf(orderVehicle?.tenantId)?.code ?? null;
+  const draftPartsTotal = partDrafts.reduce((s, p) => s + toCompany(p.quantity * p.unitCost, p.currency, draftCur), 0);
+  const draftGrandTotal = draftPartsTotal + toCompany(Number(orderForm.laborCost || 0), orderForm.laborCurrency, draftCur);
 
   const handleSelectPlanForOrder = (planId: string) => {
     const plan = preventivePlans.find((p) => p.id === planId);
@@ -397,7 +462,7 @@ export function MaintenanceWorkbench({
       ...prev,
       planId,
       title: plan ? plan.name : prev.title,
-      laborCostMxn: plan ? Math.round(plan.estimatedCostMxn * 0.35) : prev.laborCostMxn,
+      laborCost: plan ? Math.round(plan.estimatedCost * 0.35) : prev.laborCost,
       notes: plan ? plan.checklistFocus : prev.notes,
     }));
   };
@@ -418,7 +483,7 @@ export function MaintenanceWorkbench({
           name: inv.name,
           category: inv.category,
           quantity: 1,
-          unitCostMxn: inv.unitCostMxn,
+          unitCost: inv.unitCost,
         },
       ];
     });
@@ -434,10 +499,10 @@ export function MaintenanceWorkbench({
         sku: (newPartRow.sku.trim() || `REF-${100 + prev.length}`).toUpperCase(),
         name: newPartRow.name.trim(),
         quantity: Math.max(1, Number(newPartRow.quantity || 1)),
-        unitCostMxn: Math.max(0, Number(newPartRow.unitCostMxn || 0)),
+        unitCost: Math.max(0, Number(newPartRow.unitCost || 0)),
       },
     ]);
-    setNewPartRow({ sku: '', name: '', category: 'refaccion', quantity: 1, unitCostMxn: 650 });
+    setNewPartRow({ sku: '', name: '', category: 'refaccion', quantity: 1, unitCost: 650 });
   };
 
   const handleCreateOrderSubmit = async (e: React.FormEvent) => {
@@ -447,6 +512,7 @@ export function MaintenanceWorkbench({
     try {
       await onCreateWorkOrder({
         ...orderForm,
+        laborCurrency: orderForm.laborCurrency || undefined,
         planId: orderForm.planId || undefined,
         parts: partDrafts,
       });
@@ -478,7 +544,7 @@ export function MaintenanceWorkbench({
             name: inv.name,
             category: inv.category,
             quantity: 1,
-            unitCostMxn: inv.unitCostMxn,
+            unitCost: inv.unitCost,
           },
         ],
       };
@@ -499,13 +565,13 @@ export function MaintenanceWorkbench({
                 sku: (editCustomPart.sku.trim() || `REF-${200 + prev.parts.length}`).toUpperCase(),
                 name: editCustomPart.name.trim(),
                 quantity: Math.max(1, Number(editCustomPart.quantity || 1)),
-                unitCostMxn: Math.max(0, Number(editCustomPart.unitCostMxn || 0)),
+                unitCost: Math.max(0, Number(editCustomPart.unitCost || 0)),
               },
             ],
           }
         : prev
     );
-    setEditCustomPart({ sku: '', name: '', category: 'refaccion', quantity: 1, unitCostMxn: 750 });
+    setEditCustomPart({ sku: '', name: '', category: 'refaccion', quantity: 1, unitCost: 750 });
   };
 
   const handleSaveSelectedOrderEdits = async (nextStatus?: WorkOrderStatus) => {
@@ -517,7 +583,8 @@ export function MaintenanceWorkbench({
         priority: editDraft.priority,
         workshopOrTech: editDraft.workshopOrTech,
         scheduledDate: editDraft.scheduledDate,
-        laborCostMxn: editDraft.laborCostMxn,
+        laborCost: editDraft.laborCost,
+        laborCurrency: editDraft.laborCurrency || undefined,
         notes: editDraft.notes,
         clearFaultsOnClose: editDraft.clearFaultsOnClose,
         nextServiceDate: editDraft.nextServiceDate || undefined,
@@ -540,7 +607,7 @@ export function MaintenanceWorkbench({
         intervalHours: 250,
         intervalKm: 10000,
         intervalDays: 45,
-        estimatedCostMxn: 6500,
+        estimatedCost: 6500,
         checklistFocus: '',
       });
       setShowNewPlan(false);
@@ -558,7 +625,7 @@ export function MaintenanceWorkbench({
       intervalHours: pl.intervalHours,
       intervalKm: pl.intervalKm,
       intervalDays: pl.intervalDays,
-      estimatedCostMxn: pl.estimatedCostMxn,
+      estimatedCost: pl.estimatedCost,
       checklistFocus: pl.checklistFocus,
     });
   };
@@ -607,7 +674,7 @@ export function MaintenanceWorkbench({
     if (!invForm.sku.trim() || !invForm.name.trim()) return;
     setSavingInv(true);
     try {
-      await onUpsertPartInventory(invForm);
+      await onUpsertPartInventory({ ...invForm, unitCostCurrency: invForm.unitCostCurrency || undefined });
       setInvForm({
         sku: '',
         name: '',
@@ -615,7 +682,8 @@ export function MaintenanceWorkbench({
         unit: 'pza',
         stockQty: 8,
         minStock: 3,
-        unitCostMxn: 950,
+        unitCost: 950,
+        unitCostCurrency: '',
         warehouseLocation: 'Almacén Central · Rack B2',
       });
       setShowNewPartInv(false);
@@ -664,10 +732,13 @@ export function MaintenanceWorkbench({
       selectedOrder.status !== 'cancelada'
   );
 
+  const editCur = money.currencyOf(selectedOrder?.tenantId)?.code ?? null;
+  const editDate = selectedOrder?.createdAt;
   const editPartsSubtotal = editDraft
-    ? editDraft.parts.reduce((s, p) => s + p.quantity * p.unitCostMxn, 0)
+    ? editDraft.parts.reduce((s, p) => s + toCompany(p.quantity * p.unitCost, p.currency, editCur, editDate), 0)
     : 0;
-  const editGrandTotal = editDraft ? editPartsSubtotal + Number(editDraft.laborCostMxn || 0) : 0;
+  const editLabor = editDraft ? toCompany(Number(editDraft.laborCost || 0), editDraft.laborCurrency, editCur, editDate) : 0;
+  const editGrandTotal = editDraft ? editPartsSubtotal + editLabor : 0;
 
   return (
     <div className="space-y-4">
@@ -705,6 +776,9 @@ export function MaintenanceWorkbench({
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {tab === 'ordenes' && (
+            <ExportMenu url="/api/work-orders/export" label="Exportar órdenes" count={workOrders.length} fileName="ordenes-trabajo" />
+          )}
           {tab === 'ordenes' && canWriteFleet && (
             <button
               type="button"
@@ -769,9 +843,9 @@ export function MaintenanceWorkbench({
             </div>
           </div>
           <div className="bg-[#11192C] border border-slate-800/80 rounded-xl p-3.5">
-            <div className="text-xs text-slate-400">Inversión órdenes MXN</div>
+            <div className="text-xs text-slate-400">Inversión órdenes {money.currencyOf()?.code ?? ''}</div>
             <div className="text-xl font-semibold font-mono tabular-nums text-emerald-400 mt-1">
-              ${totalWorkOrdersMxn.toLocaleString('es-MX')}
+              <Money amount={totalWorkOrders} showEquivalent={!money.consolidated} />
             </div>
           </div>
           <div className="bg-[#11192C] border border-slate-800/80 rounded-xl p-3.5">
@@ -822,7 +896,7 @@ export function MaintenanceWorkbench({
                   Apertura de orden de trabajo y presupuesto de refacciones
                 </div>
                 <div className="font-mono tabular-nums text-emerald-400 font-semibold">
-                  Total estimado: ${draftGrandTotal.toLocaleString('es-MX')} MXN
+                  Total estimado: {showAmount(draftGrandTotal, draftCur)} {draftCur ?? ''}
                 </div>
               </div>
 
@@ -930,12 +1004,12 @@ export function MaintenanceWorkbench({
                       <option value="">+ Agregar desde almacén...</option>
                       {partsInventory.map((inv) => (
                         <option key={inv.id} value={inv.sku}>
-                          {inv.sku} · {inv.name} (Stock: {inv.stockQty} {inv.unit} · ${inv.unitCostMxn})
+                          {inv.sku} · {inv.name} (Stock: {inv.stockQty} {inv.unit} · {money.fmt(inv.unitCost, inv.tenantId)})
                         </option>
                       ))}
                     </select>
                     <span className="font-mono tabular-nums text-slate-300">
-                      Materiales: ${draftPartsTotal.toLocaleString('es-MX')} MXN
+                      Materiales: {showAmount(draftPartsTotal, draftCur)}
                     </span>
                   </div>
                 </div>
@@ -960,8 +1034,11 @@ export function MaintenanceWorkbench({
                       </div>
                       <div className="flex items-center gap-3 font-mono tabular-nums">
                         <span className="text-slate-300">
-                          {pt.quantity} × ${pt.unitCostMxn.toLocaleString('es-MX')} = $
-                          {(pt.quantity * pt.unitCostMxn).toLocaleString('es-MX')}
+                          {pt.quantity} × {money.fmtIn(pt.unitCost, pt.currency ?? draftCur)} ={' '}
+                          {money.fmtIn(pt.quantity * pt.unitCost, pt.currency ?? draftCur)}
+                          {pt.currency && pt.currency !== draftCur && (
+                            <span className="text-amber-300"> ≈ {showAmount(toCompany(pt.quantity * pt.unitCost, pt.currency, draftCur), draftCur)}</span>
+                          )}
                         </span>
                         <button
                           type="button"
@@ -1002,7 +1079,7 @@ export function MaintenanceWorkbench({
                     <option value="insumo">Insumo</option>
                     <option value="mano_obra">Subcontrato</option>
                   </select>
-                  <div className="grid grid-cols-2 gap-1.5">
+                  <div className="grid grid-cols-3 gap-1.5">
                     <input
                       type="number"
                       min={1}
@@ -1014,10 +1091,16 @@ export function MaintenanceWorkbench({
                     <input
                       type="number"
                       min={0}
-                      value={newPartRow.unitCostMxn}
-                      onChange={(e) => setNewPartRow((p) => ({ ...p, unitCostMxn: Number(e.target.value) }))}
+                      value={newPartRow.unitCost}
+                      onChange={(e) => setNewPartRow((p) => ({ ...p, unitCost: Number(e.target.value) }))}
                       className="px-2 py-1.5 bg-[#11192C] border border-slate-800 rounded text-slate-100 font-mono"
-                      title="Costo unitario MXN"
+                      title={`Costo unitario (${newPartRow.currency ?? draftCur ?? 'moneda de la empresa'})`}
+                    />
+                    <CurrencySelect
+                      value={newPartRow.currency ?? ''}
+                      companyCode={draftCur}
+                      onChange={(c) => setNewPartRow((p) => ({ ...p, currency: c || undefined }))}
+                      className="px-1 py-1.5 bg-[#11192C] border border-slate-800 rounded text-slate-100"
                     />
                   </div>
                   <button
@@ -1032,14 +1115,23 @@ export function MaintenanceWorkbench({
 
               <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
                 <div>
-                  <label className="block text-slate-400 mb-1">Mano de obra taller (MXN)</label>
-                  <input
-                    type="number"
-                    min={0}
-                    value={orderForm.laborCostMxn}
-                    onChange={(e) => setOrderForm((p) => ({ ...p, laborCostMxn: Number(e.target.value) }))}
-                    className="w-full px-3 py-2 bg-[#0B1120] border border-slate-800 rounded-lg font-mono text-slate-100"
-                  />
+                  <label className="block text-slate-400 mb-1">Mano de obra taller ({orderForm.laborCurrency || draftCur || 'sin moneda'})</label>
+                  <div className="flex gap-1.5">
+                    <input
+                      type="number"
+                      min={0}
+                      value={orderForm.laborCost}
+                      onChange={(e) => setOrderForm((p) => ({ ...p, laborCost: Number(e.target.value) }))}
+                      className="w-full px-3 py-2 bg-[#0B1120] border border-slate-800 rounded-lg font-mono text-slate-100"
+                    />
+                    <CurrencySelect
+                      value={orderForm.laborCurrency}
+                      companyCode={draftCur}
+                      onChange={(c) => setOrderForm((p) => ({ ...p, laborCurrency: c }))}
+                      className="px-1.5 py-2 bg-[#0B1120] border border-slate-800 rounded-lg text-slate-100"
+                    />
+                  </div>
+                  <ConversionHint amount={Number(orderForm.laborCost || 0)} from={orderForm.laborCurrency} to={draftCur} />
                 </div>
                 <div>
                   <label className="block text-slate-400 mb-1">Notas técnicas</label>
@@ -1137,7 +1229,7 @@ export function MaintenanceWorkbench({
                       <th className="py-2.5 px-4">Orden / Prioridad</th>
                       <th className="py-2.5 px-4">Trabajo / Taller</th>
                       <th className="py-2.5 px-4">Estado / Fecha</th>
-                      <th className="py-2.5 px-4 text-right">Costo MXN</th>
+                      <th className="py-2.5 px-4 text-right">Costo</th>
                       <th className="py-2.5 px-4 text-right">Flujo</th>
                     </tr>
                   </thead>
@@ -1181,10 +1273,10 @@ export function MaintenanceWorkbench({
                               <div className={`font-medium ${st.colorClass}`}>{st.label}</div>
                               <div className="font-mono text-slate-500">{formatServiceDate(wo.scheduledDate)}</div>
                             </td>
-                            <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-200">
-                              <div>${wo.totalCostMxn.toLocaleString('es-MX')}</div>
+                            <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-200 whitespace-nowrap">
+                              <div>{money.fmt(wo.totalCost, wo.tenantId)}</div>
                               <div className="text-slate-500">
-                                Ref: ${wo.partsCostMxn.toLocaleString('es-MX')}
+                                Ref: {money.fmt(wo.partsCost, wo.tenantId)}
                               </div>
                             </td>
                             <td className="py-2.5 px-4 text-right whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
@@ -1272,22 +1364,23 @@ export function MaintenanceWorkbench({
                     <div className="p-2 rounded bg-[#0B1120] border border-slate-800">
                       <div className="text-[11px] text-slate-500">Refacciones</div>
                       <div className="text-slate-200 font-semibold mt-0.5">
-                        ${(isSelectedOrderEditable ? editPartsSubtotal : selectedOrder.partsCostMxn).toLocaleString('es-MX')}
+                        {showAmount(isSelectedOrderEditable ? editPartsSubtotal : selectedOrder.partsCost, editCur)}
                       </div>
                     </div>
                     <div className="p-2 rounded bg-[#0B1120] border border-slate-800">
                       <div className="text-[11px] text-slate-500">Mano obra</div>
                       <div className="text-slate-200 font-semibold mt-0.5">
-                        $
-                        {(isSelectedOrderEditable ? editDraft.laborCostMxn : selectedOrder.laborCostMxn).toLocaleString(
-                          'es-MX'
-                        )}
+                        {showAmount(isSelectedOrderEditable ? editLabor : selectedOrder.laborCost, editCur)}
                       </div>
                     </div>
                     <div className="p-2 rounded bg-[#0B1120] border border-emerald-500/30">
-                      <div className="text-[11px] text-slate-500">Total MXN</div>
+                      <div className="text-[11px] text-slate-500">Total {editCur ?? ''}</div>
                       <div className="text-emerald-400 font-semibold mt-0.5">
-                        ${(isSelectedOrderEditable ? editGrandTotal : selectedOrder.totalCostMxn).toLocaleString('es-MX')}
+                        {isSelectedOrderEditable ? (
+                          showAmount(editGrandTotal, editCur)
+                        ) : (
+                          <Money amount={selectedOrder.totalCost} tenantId={selectedOrder.tenantId} date={selectedOrder.completedAt || selectedOrder.createdAt} showEquivalent />
+                        )}
                       </div>
                     </div>
                   </div>
@@ -1338,18 +1431,27 @@ export function MaintenanceWorkbench({
                           />
                         </div>
                         <div>
-                          <label className="block text-slate-400 mb-1">Mano de obra (MXN)</label>
-                          <input
-                            type="number"
-                            min={0}
-                            value={editDraft.laborCostMxn}
-                            onChange={(e) =>
-                              setEditDraft((p) =>
-                                p ? { ...p, laborCostMxn: Math.max(0, Number(e.target.value)) } : p
-                              )
-                            }
-                            className="w-full px-2.5 py-1.5 bg-[#0B1120] border border-slate-800 rounded font-mono text-slate-100"
-                          />
+                          <label className="block text-slate-400 mb-1">Mano de obra ({editDraft.laborCurrency || editCur || 'sin moneda'})</label>
+                          <div className="flex gap-1">
+                            <input
+                              type="number"
+                              min={0}
+                              value={editDraft.laborCost}
+                              onChange={(e) =>
+                                setEditDraft((p) =>
+                                  p ? { ...p, laborCost: Math.max(0, Number(e.target.value)) } : p
+                                )
+                              }
+                              className="w-full px-2.5 py-1.5 bg-[#0B1120] border border-slate-800 rounded font-mono text-slate-100"
+                            />
+                            <CurrencySelect
+                              value={editDraft.laborCurrency}
+                              companyCode={editCur}
+                              onChange={(c) => setEditDraft((p) => (p ? { ...p, laborCurrency: c } : p))}
+                              className="px-1 py-1.5 bg-[#0B1120] border border-slate-800 rounded text-slate-100"
+                            />
+                          </div>
+                          <ConversionHint amount={Number(editDraft.laborCost || 0)} from={editDraft.laborCurrency} to={editCur} date={editDate} />
                         </div>
                       </div>
 
@@ -1367,7 +1469,7 @@ export function MaintenanceWorkbench({
                             <option value="">+ Del almacén...</option>
                             {partsInventory.map((inv) => (
                               <option key={inv.id} value={inv.sku}>
-                                {inv.sku} · Stock {inv.stockQty} · ${inv.unitCostMxn}
+                                {inv.sku} · Stock {inv.stockQty} · {money.fmt(inv.unitCost, inv.tenantId)}
                               </option>
                             ))}
                           </select>
@@ -1388,7 +1490,7 @@ export function MaintenanceWorkbench({
                                   <div className="min-w-0">
                                     <div className="text-slate-200 truncate">{pt.name}</div>
                                     <div className="font-mono text-[11px] text-slate-500">
-                                      {pt.sku} · {pt.quantity} × ${pt.unitCostMxn.toLocaleString('es-MX')}
+                                      {pt.sku} · {pt.quantity} × {money.fmtIn(pt.unitCost, pt.currency ?? editCur)}
                                       {inv && (
                                         <span className={insufficient ? ' text-rose-400' : ' text-emerald-400'}>
                                           {' '}
@@ -1399,7 +1501,7 @@ export function MaintenanceWorkbench({
                                   </div>
                                   <div className="flex items-center gap-2 shrink-0">
                                     <span className="font-mono tabular-nums text-slate-200">
-                                      ${(pt.quantity * pt.unitCostMxn).toLocaleString('es-MX')}
+                                      {showAmount(toCompany(pt.quantity * pt.unitCost, pt.currency, editCur, editDate), editCur)}
                                     </span>
                                     <button
                                       type="button"
@@ -1535,7 +1637,12 @@ export function MaintenanceWorkbench({
                                 </div>
                               </div>
                               <div className="font-mono tabular-nums text-slate-200 shrink-0">
-                                ${pt.subtotalMxn.toLocaleString('es-MX')}
+                                {money.fmt(pt.subtotal, selectedOrder.tenantId)}
+                                {pt.original && (
+                                  <div className="text-[10px] text-amber-300" title="Cargado en otra moneda; convertido con el TC de la fecha de la orden">
+                                    {money.fmtIn(pt.original.amount * pt.quantity, pt.original.currency)}
+                                  </div>
+                                )}
                               </div>
                             </div>
                           ))
@@ -1625,12 +1732,12 @@ export function MaintenanceWorkbench({
                   />
                 </div>
                 <div>
-                  <label className="block text-slate-400 mb-1">Presupuesto base (MXN)</label>
+                  <label className="block text-slate-400 mb-1">Presupuesto base ({money.currencyOf()?.code ?? 'sin moneda'})</label>
                   <input
                     type="number"
                     min={0}
-                    value={planForm.estimatedCostMxn}
-                    onChange={(e) => setPlanForm((p) => ({ ...p, estimatedCostMxn: Number(e.target.value) }))}
+                    value={planForm.estimatedCost}
+                    onChange={(e) => setPlanForm((p) => ({ ...p, estimatedCost: Number(e.target.value) }))}
                     className="w-full px-3 py-2 bg-[#0B1120] border border-slate-800 rounded-lg font-mono text-slate-100"
                   />
                 </div>
@@ -1724,13 +1831,13 @@ export function MaintenanceWorkbench({
                   />
                 </div>
                 <div>
-                  <label className="block text-slate-400 mb-1">Costo base MXN</label>
+                  <label className="block text-slate-400 mb-1">Costo base ({money.currencyOf()?.code ?? 'sin moneda'})</label>
                   <input
                     type="number"
                     min={0}
-                    value={editPlanForm.estimatedCostMxn}
+                    value={editPlanForm.estimatedCost}
                     onChange={(e) =>
-                      setEditPlanForm((p) => ({ ...p, estimatedCostMxn: Number(e.target.value) }))
+                      setEditPlanForm((p) => ({ ...p, estimatedCost: Number(e.target.value) }))
                     }
                     className="w-full px-3 py-2 bg-[#0B1120] border border-slate-800 rounded-lg font-mono text-slate-100"
                   />
@@ -1853,7 +1960,7 @@ export function MaintenanceWorkbench({
                           {pl.intervalHours} h · {pl.intervalKm.toLocaleString('es-MX')} km · {pl.intervalDays} d
                         </td>
                         <td className="py-2.5 px-4 text-right font-mono tabular-nums">
-                          <div className="text-emerald-400">${pl.estimatedCostMxn.toLocaleString('es-MX')} MXN</div>
+                          <div className="text-emerald-400">{money.fmt(pl.estimatedCost, pl.tenantId, { withCode: true })}</div>
                           <div className="text-slate-400">{assignedCount} asignada(s)</div>
                         </td>
                         <td className="py-2.5 px-4 text-right whitespace-nowrap space-x-1.5">
@@ -1929,9 +2036,9 @@ export function MaintenanceWorkbench({
               </div>
             </div>
             <div className="bg-[#11192C] border border-slate-800/80 rounded-xl p-3.5">
-              <div className="text-xs text-slate-400">Valor total en almacén (MXN)</div>
+              <div className="text-xs text-slate-400">Valor total en almacén ({money.currencyOf()?.code ?? 'sin moneda'})</div>
               <div className="text-xl font-semibold font-mono tabular-nums text-emerald-400 mt-1">
-                ${Math.round(totalInventoryValueMxn).toLocaleString('es-MX')} MXN
+                <Money amount={totalInventoryValue} showEquivalent={!money.consolidated} />
               </div>
             </div>
           </div>
@@ -1993,14 +2100,23 @@ export function MaintenanceWorkbench({
                   />
                 </div>
                 <div>
-                  <label className="block text-slate-400 mb-1">Costo unit. (MXN)</label>
-                  <input
-                    type="number"
-                    min={0}
-                    value={invForm.unitCostMxn}
-                    onChange={(e) => setInvForm((p) => ({ ...p, unitCostMxn: Number(e.target.value) }))}
-                    className="w-full px-3 py-2 bg-[#0B1120] border border-slate-800 rounded-lg font-mono text-slate-100"
-                  />
+                  <label className="block text-slate-400 mb-1">Costo unit. ({invForm.unitCostCurrency || money.currencyOf()?.code || 'sin moneda'})</label>
+                  <div className="flex gap-1.5">
+                    <input
+                      type="number"
+                      min={0}
+                      value={invForm.unitCost}
+                      onChange={(e) => setInvForm((p) => ({ ...p, unitCost: Number(e.target.value) }))}
+                      className="w-full px-3 py-2 bg-[#0B1120] border border-slate-800 rounded-lg font-mono text-slate-100"
+                    />
+                    <CurrencySelect
+                      value={invForm.unitCostCurrency}
+                      companyCode={money.currencyOf()?.code ?? null}
+                      onChange={(c) => setInvForm((p) => ({ ...p, unitCostCurrency: c }))}
+                      className="px-1.5 py-2 bg-[#0B1120] border border-slate-800 rounded-lg text-slate-100"
+                    />
+                  </div>
+                  <ConversionHint amount={Number(invForm.unitCost || 0)} from={invForm.unitCostCurrency} to={money.currencyOf()?.code ?? null} />
                 </div>
                 <div>
                   <label className="block text-slate-400 mb-1">Unidad / Anaquel</label>
@@ -2099,8 +2215,13 @@ export function MaintenanceWorkbench({
                               Mín: {item.minStock} {item.unit}
                             </div>
                           </td>
-                          <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-200">
-                            ${item.unitCostMxn.toLocaleString('es-MX')} MXN
+                          <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-200 whitespace-nowrap">
+                            {money.fmt(item.unitCost, item.tenantId, { withCode: true })}
+                            {item.unitCostOriginal && (
+                              <div className="text-[10px] text-amber-300">
+                                cargado {money.fmtIn(item.unitCostOriginal.amount, item.unitCostOriginal.currency, { withCode: true })}
+                              </div>
+                            )}
                           </td>
                           <td className="py-2.5 px-4 text-right whitespace-nowrap space-x-1.5">
                             <button
@@ -2398,7 +2519,7 @@ export function MaintenanceWorkbench({
                 </div>
                 <div className="text-right font-mono tabular-nums text-slate-300">
                   <div>
-                    {r.engineHoursAtService} h · ${r.costMxn.toLocaleString('es-MX')} MXN
+                    {r.engineHoursAtService} h · {money.fmt(r.cost, r.tenantId, { withCode: true })}
                   </div>
                   <div className="text-slate-500">{formatRelativeTime(r.performedAt)}</div>
                 </div>

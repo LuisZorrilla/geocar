@@ -15,6 +15,19 @@ import type {
   WorkOrderStatus,
 } from '../shared/types.ts';
 
+export {
+  ASSET_TYPE_LABELS,
+  MAINTENANCE_META,
+  WORK_ORDER_STATUS_META,
+  WORK_ORDER_PRIORITY_META,
+  STATUS_META,
+  LINK_META,
+  PRIORITY_META,
+  ALERT_STATUS_META,
+  INCIDENT_STATUS_META,
+} from '../shared/labels.ts';
+import { ASSET_TYPE_LABELS, MAINTENANCE_META, WORK_ORDER_STATUS_META, WORK_ORDER_PRIORITY_META, STATUS_META, LINK_META, PRIORITY_META, ALERT_STATUS_META, INCIDENT_STATUS_META } from '../shared/labels.ts';
+
 const TOKEN_STORAGE_KEY = 'fleetops_auth_token';
 const TENANT_SCOPE_KEY = 'fleetops_tenant_scope';
 
@@ -79,6 +92,77 @@ export async function apiRequest<T>(url: string, options: RequestInit = {}): Pro
     throw new Error(typeof data.error === 'string' ? data.error : `Error HTTP ${res.status}`);
   }
   return data as T;
+}
+
+/**
+ * Opens a protected file (PDF or image) in a new tab without putting the session token in the URL.
+ * The tab is opened before the download so popup blockers treat it as a user action.
+ */
+export async function openWithAuth(url: string): Promise<void> {
+  const tab = window.open('', '_blank');
+  const headers = new Headers();
+  const token = getAuthToken();
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  const scope = getTenantScope();
+  if (scope) headers.set('x-tenant-scope', scope);
+  try {
+    const res = await fetch(url, { headers });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(typeof data.error === 'string' ? data.error : `Error HTTP ${res.status}`);
+    }
+    const blobUrl = URL.createObjectURL(await res.blob());
+    if (tab) tab.location.href = blobUrl;
+    else window.location.assign(blobUrl);
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+  } catch (err) {
+    tab?.close();
+    throw err;
+  }
+}
+
+/** Fetches a protected file as a Blob (for in-page previews), sending the session in the header. */
+export async function fetchBlobWithAuth(url: string): Promise<Blob> {
+  const headers = new Headers();
+  const token = getAuthToken();
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  const scope = getTenantScope();
+  if (scope) headers.set('x-tenant-scope', scope);
+  const res = await fetch(url, { headers });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(typeof data.error === 'string' ? data.error : `Error HTTP ${res.status}`);
+  }
+  return res.blob();
+}
+
+/** Uploads a file as the raw request body (PUT), reporting progress from 0 to 1. */
+export function uploadWithAuth<T>(url: string, file: File, onProgress?: (fraction: number) => void): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', url);
+    const token = getAuthToken();
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+    const scope = getTenantScope();
+    if (scope) xhr.setRequestHeader('x-tenant-scope', scope);
+    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+    xhr.setRequestHeader('x-file-name', encodeURIComponent(file.name));
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress?.(e.loaded / e.total);
+    };
+    xhr.onload = () => {
+      let data: { error?: unknown } = {};
+      try {
+        data = JSON.parse(xhr.responseText || '{}');
+      } catch {
+        /* non-JSON error page */
+      }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data as T);
+      else reject(new Error(typeof data.error === 'string' ? data.error : `Error HTTP ${xhr.status}`));
+    };
+    xhr.onerror = () => reject(new Error('No se pudo conectar con el servidor.'));
+    xhr.send(file);
+  });
 }
 
 /**
@@ -158,35 +242,6 @@ export function suggestNextServiceDate(engineHours: number, targetServiceHours: 
   return target.toISOString().slice(0, 10);
 }
 
-export const ASSET_TYPE_LABELS: Record<AssetType, string> = {
-  vehiculo: 'Vehículo',
-  maquinaria_pesada: 'Maquinaria pesada',
-};
-
-export const MAINTENANCE_META: Record<MaintenanceStatus, { label: string; colorClass: string }> = {
-  al_dia: { label: 'Al día', colorClass: 'text-emerald-400' },
-  proximo: { label: 'Servicio próximo', colorClass: 'text-amber-400' },
-  vencido: { label: 'Servicio vencido', colorClass: 'text-rose-400' },
-};
-
-export const WORK_ORDER_STATUS_META: Record<WorkOrderStatus, { label: string; colorClass: string }> = {
-  abierta: { label: 'Abierta', colorClass: 'text-sky-400' },
-  en_taller: { label: 'En taller', colorClass: 'text-amber-400' },
-  esperando_refacciones: { label: 'Esperando refacciones', colorClass: 'text-rose-400' },
-  completada: { label: 'Completada', colorClass: 'text-emerald-400' },
-  cancelada: { label: 'Cancelada', colorClass: 'text-slate-400' },
-};
-
-export const WORK_ORDER_PRIORITY_META: Record<
-  WorkOrderPriority,
-  { label: string; colorClass: string; rank: number }
-> = {
-  critica: { label: 'Crítica', colorClass: 'text-rose-400', rank: 0 },
-  alta: { label: 'Alta', colorClass: 'text-amber-400', rank: 1 },
-  media: { label: 'Media', colorClass: 'text-sky-400', rank: 2 },
-  baja: { label: 'Baja', colorClass: 'text-slate-400', rank: 3 },
-};
-
 export function sortWorkOrdersByPriority(orders: WorkOrder[], vehicles: Vehicle[]): WorkOrder[] {
   const vehMap = new Map(vehicles.map((v) => [v.id, v]));
   const isClosed = (s: WorkOrderStatus) => s === 'completada' || s === 'cancelada';
@@ -216,9 +271,10 @@ export const CHECKLIST_RESULT_META: Record<PreOpChecklistResult, { label: string
 
 export const VENDOR_FAMILY_LABELS: Record<DashcamVendorFamily, string> = {
   howen_streamax: 'Howen / Streamax (JT808/JT1078)',
-  jimi_concox: 'Jimi / Concox (JC400 / JC450)',
+  jimi_concox: 'Jimi / Concox (JC181 / JC261 / JC400)',
   teltonika_fmc: 'Teltonika FMC (CAN + RS232)',
   hikvision_dahua: 'Hikvision Mobile / Dahua MDVR',
+  jt808_generico: 'JT/T 808 genérico (Meitrack, MettaX y otros)',
 };
 
 export const DEFAULT_VEHICLE_CHECKLIST_LABELS = [
@@ -236,39 +292,6 @@ export const DEFAULT_MACHINERY_CHECKLIST_LABELS = [
   'Niveles de aceite hidráulico, motor diésel y refrigerante',
   'Cámaras MDVR 360° / cabina y telemetría CAN J1939',
 ];
-
-export const STATUS_META: Record<OperationalStatus, { label: string; colorClass: string; dotHex: string }> = {
-  en_ruta: { label: 'En ruta / Operando', colorClass: 'text-emerald-400', dotHex: '#22C55E' },
-  detenido: { label: 'Detenido', colorClass: 'text-slate-300', dotHex: '#94A3B8' },
-  alerta: { label: 'En alerta', colorClass: 'text-rose-400', dotHex: '#EF4444' },
-  sin_senal: { label: 'Sin señal', colorClass: 'text-amber-400', dotHex: '#F59E0B' },
-};
-
-export const LINK_META: Record<LinkStatus, { label: string; colorClass: string }> = {
-  conectado: { label: 'Conectado', colorClass: 'text-emerald-400' },
-  intermitente: { label: 'Intermitente', colorClass: 'text-amber-400' },
-  desconectado: { label: 'Desconectado', colorClass: 'text-rose-400' },
-};
-
-export const PRIORITY_META: Record<AlertPriority, { label: string; colorClass: string }> = {
-  critica: { label: 'Crítica', colorClass: 'text-rose-400' },
-  alta: { label: 'Alta', colorClass: 'text-amber-400' },
-  media: { label: 'Media', colorClass: 'text-sky-400' },
-  informativa: { label: 'Informativa', colorClass: 'text-slate-400' },
-};
-
-export const ALERT_STATUS_META: Record<AlertStatus, { label: string; colorClass: string }> = {
-  pendiente: { label: 'Pendiente', colorClass: 'text-amber-400' },
-  confirmada: { label: 'Confirmada', colorClass: 'text-emerald-400' },
-  escalada: { label: 'Escalada a incidente', colorClass: 'text-rose-400' },
-};
-
-export const INCIDENT_STATUS_META: Record<IncidentStatus, { label: string; colorClass: string }> = {
-  abierto: { label: 'Abierto', colorClass: 'text-amber-400' },
-  en_investigacion: { label: 'En investigación', colorClass: 'text-sky-400' },
-  escalado: { label: 'Escalado', colorClass: 'text-rose-400' },
-  resuelto: { label: 'Resuelto', colorClass: 'text-emerald-400' },
-};
 
 export const PERMISSION_LABELS: Record<PermissionLevel, { label: string; colorClass: string }> = {
   full: { label: 'Control total', colorClass: 'text-emerald-400' },

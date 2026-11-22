@@ -1,4 +1,4 @@
-# Vigilant FleetOps: hoja de ruta de prototipo a producción
+# Vigilant GeoCar: hoja de ruta de prototipo a producción
 
 **Supuestos:**
 - Arranque con menos de 200 unidades.
@@ -59,6 +59,25 @@ Navegador ◄─HTTPS + WebSocket─► API Express ◄─► PostgreSQL / Redis
 - [ ] Recuperación de contraseña por correo y 2FA para administradores.
 - [ ] Catálogo de drivers de dashcam: hoy es global y lo puede ampliar cualquier admin de empresa. Decidir si pasa a ser solo del superadmin.
 
+## Conexión cámaras → Starlink → panel (inicio de Fase 2)
+
+- [x] Asistente en **Configuración de Cámaras → Conexión**: datos del servidor para programar cada cámara, guía en 4 pasos, ID de terminal, vía de salida y red WiFi por equipo, y estado de conexión.
+- [x] Ingesta desde Traccar (`POST /ingest/traccar/position` y `/event`) con token compartido. Las posiciones reales mueven las unidades en el mapa; las alarmas crean alertas; los IDs desconocidos quedan «sin asignar».
+- [x] Simulador `npm run traccar:sim` y guía [TRACCAR.md](TRACCAR.md).
+- [x] Guía de piloto en PC con Traccar para Windows y túnel o reenvío de puertos ([PILOTO-LOCAL.md](PILOTO-LOCAL.md)), más `npm run traccar:config` y `npm run traccar:check`.
+- [ ] Confirmar con Traccar real la forma del JSON de reenvío y el puerto de video.
+- [ ] Paquete Docker para el VPS (Traccar + panel + PostgreSQL + HTTPS).
+- [ ] WebSocket en lugar del polling del mapa.
+- [ ] Video JT/T 1078 dentro del panel (Fase 3).
+
+## Alta y gestión de empresas (superadmin)
+
+- [x] Menú **Empresas**, solo para el superadmin: listado con uso del cupo, editar, suspender o reactivar (bloquea el ingreso y cierra sesiones) y restablecer la contraseña del admin.
+- [x] **Asistente en 4 pasos**: empresa (CUIT validado), plan y servicio, usuario administrador y revisión. Crea la empresa, sus 3 perfiles base, el admin con acceso total a los 10 módulos y plantillas opcionales (planes preventivos y reglas de alerta).
+- [x] Contraseña temporal que se muestra una sola vez, con **cambio obligatorio en el primer ingreso**.
+- [x] Cupo de unidades aplicado al registrar vehículos.
+- [x] Con `SEED_DEMO_DATA=false`, una base nueva ya se puede poner en marcha: el superadmin crea las empresas desde el panel.
+
 ## Cómo probar con una dashcam real (Fase 0)
 
 1. Arrancar el listener con `npm run gateway`. Escucha en TCP `JT808_PORT`, por defecto 7611.
@@ -79,3 +98,100 @@ Navegador ◄─HTTPS + WebSocket─► API Express ◄─► PostgreSQL / Redis
 3. Copiar `.env.example` a `.env` y ajustar `DATABASE_URL`.
 4. Ejecutar `npm install` y luego `npm run dev`. Con `SEED_DEMO_DATA=true` la primera ejecución siembra los datos demo e imprime las credenciales en la consola.
 5. `npm run db:reset` borra todas las tablas y vuelve a sembrar. **Es solo para desarrollo.**
+
+## Registro de choferes (superadmin y admin de empresa)
+
+Menú **Choferes**, después de «Empresas».
+
+- **Alta en 5 pasos:**
+  1. Datos personales, con DNI y CUIL validados (el CUIL debe coincidir con el DNI).
+  2. Perfil y clases de licencia.
+  3. Documentación: datos, vencimiento y archivo de cada documento.
+  4. Asignación: sucursal, legajo y unidad.
+  5. Revisión, que anticipa si el chofer quedará autorizado.
+- **Documentos obligatorios según el perfil:**
+  - liviano: DNI y licencia;
+  - profesional: además LiNTI y psicofísico;
+  - maquinaria: además el certificado de operador;
+  - si transporta cargas peligrosas, también el curso.
+- **Estado calculado:** Habilitado, Por vencer (30 días o menos), No autorizado (falta un documento, uno vencido o una clase insuficiente) o Deshabilitado (a mano, con motivo).
+  - Un chofer no autorizado no puede asignarse a una unidad.
+  - Un barrido cada hora genera una alerta en la unidad del chofer que pasa a no autorizado.
+- **Archivos** (PDF, JPG o PNG, máximo 5 MB, validados por su contenido) en la tabla `driver_files` de PostgreSQL (migración 003), incluidos en el `pg_dump`.
+- **Listado** con paginación desde el servidor (10, 25 o 50 por página), buscador sin acentos, filtros y contadores que filtran. Los cambios se reflejan al instante y el listado se refresca cada 30 s.
+- **Alta de activos:** «Chofer asignado» elige entre los choferes autorizados. Ya no se crean choferes a partir de texto libre.
+- **Datos personales:** los perfiles que no son administradores reciben el padrón sin DNI, CUIL ni documentos.
+- **Verificación por un administrador:** cada documento obligatorio queda «Pendiente de verificación» hasta que un admin compara el archivo con los datos y lo marca «Verificado», o «Rechazado» con motivo.
+  - El archivo es obligatorio para verificar.
+  - Si cambian los datos, el archivo, las clases de licencia o el DNI, el documento vuelve a quedar pendiente.
+  - Un chofer pendiente no puede tener unidad nueva; los que ya existían conservan las suyas, sin alertas.
+  - Pantalla de revisión con vista previa y lista de control.
+- **Pendiente:**
+  - adjuntar y verificar los archivos de los choferes que vienen de la base anterior (aparecen como «Sin respaldo»);
+  - avisos por email de vencimientos.
+
+## Exportaciones (PDF, Excel y CSV)
+
+Cada pantalla con datos tiene un botón **«Exportar ▾»** con tres formatos. Se exporta lo que el usuario puede ver en su empresa y con los filtros de la pantalla.
+
+| Exportación | Dónde | Endpoint |
+|---|---|---|
+| Flota y mantenimiento | Flotas y Maquinaria, Perfiles y Reportes | `GET /api/reports/export` |
+| Ficha de una unidad | Ficha técnica, Monitoreo en Vivo | `GET /api/vehicles/:id/export` |
+| Órdenes de trabajo y repuestos | Mantenimiento | `GET /api/work-orders/export` |
+| Choferes y documentación (con filtros) | Choferes | `GET /api/drivers/export` |
+| Alertas e incidentes (con prioridad) | Alertas e Incidentes | `GET /api/alerts/export` |
+
+- **Formato:** `?format=pdf|xlsx|csv`. Si no se indica, es CSV. El JSON de la ficha se eliminó.
+- **PDF** (para leer, imprimir o enviar):
+  - portada con filtros, indicadores e índice con enlaces;
+  - marcadores por sección;
+  - tablas con el encabezado repetido en cada página, estados como etiqueta con texto y fila de totales;
+  - pie «Generado por… · Página N de M».
+- **Excel** (para filtrar y calcular):
+  - hoja «Resumen» con indicadores que son fórmulas sobre los datos y enlaces a cada hoja;
+  - una Tabla de Excel por sección, con filtros, encabezado fijo y totales con `SUBTOTAL` que respetan el filtro;
+  - fechas y montos con tipo real;
+  - lista para imprimir.
+- **CSV:** formato de Excel en español (separador `;`, coma decimal y BOM) y protegido contra fórmulas. El de órdenes de trabajo conserva sus columnas originales.
+- **Auditoría:** cada exportación queda registrada («Exportó … (PDF)»).
+- **Código:**
+  - `server/export/`: `report.ts` (modelo), `reports.ts` (los 5 reportes), `pdf.ts` (pdfkit), `xlsx.ts` (exceljs), `csv.ts` y `send.ts`;
+  - `src/components/ExportMenu.tsx`.
+
+## Telemetría OBD-II (Teltonika FMC003)
+
+Datos reales de motor por el conector OBD-II de los vehículos livianos. Guía completa: `docs/OBD-II.md` y `docs/configuracion-obd2.pdf`.
+
+- **Pantalla:** Configuración de Cámaras → pestaña **Telemetría OBD-II** (después de «Conexión»). Datos para programar el equipo (host, puerto `5027`, Codec 8 Extended, SMS), los pasos, y la tabla por unidad con RPM, temperatura, combustible, batería, odómetro, VIN, fallas activas y fuente (OBD-II en vivo o simulada).
+- **Equipo:** `Device.role = 'telemetria'`, ligado a la unidad (`Vehicle.obdDeviceId`). Identificador en Traccar = IMEI. API `PUT|DELETE /api/vehicles/:id/obd`.
+- **Ingesta:** Traccar (protocolo `teltonika`, `5027/TCP`) → `/ingest/traccar/position`. Claves estándar (`rpm`, `coolantTemp`, `fuelLevel`, `obdOdometer`, `hours`, `power`, `vin`, `dtcs`) y respaldo `ioNN` de Teltonika (`TELTONIKA_IO`, a confirmar con un equipo real).
+- **Códigos de falla:** cada DTC nuevo → falla activa con descripción en español (`src/shared/dtc.ts`), alerta y OT correctiva (una por unidad y código). Al borrarse sale de fallas activas; la OT la cierra el taller.
+- **Camiones y maquinaria:** no tienen OBD-II; usan CAN J1939 con un equipo como el FMC650.
+- **Alta desde el panel:** asistente de 3 pasos (datos + APN → SMS de programación → espera del primer reporte). El panel crea el dispositivo en Traccar por su API (`server/traccar/client.ts`, `TRACCAR_WEB_URL` + `TRACCAR_ADMIN_EMAIL/PASSWORD`); si falla, «Reintentar alta» (`POST /api/vehicles/:id/obd/sync`). Quitar el equipo lo borra de Traccar.
+- **Configuración remota:** comandos Teltonika predefinidos (sin texto libre) por GPRS vía `POST /api/commands/send` de Traccar: versión, estado, datos OBD, códigos de falla, frecuencia de reporte, Codec 8 Extended y reinicio. `POST /api/vehicles/:id/obd/commands`; historial de los últimos 20 con la respuesta del equipo (evento `commandResult`).
+- **Seguimiento:** detalle por unidad con conexión, salud (`src/shared/obdHealth.ts`), gráficos de RPM, temperatura, combustible y batería (24 h / 7 d / 30 d, con vista de tabla), historial de fallas y comandos. Historial en PostgreSQL (`004_obd_history.sql`: `obd_samples`, una muestra por minuto, 90 días; `obd_fault_events`).
+- **Pendiente:** validar con un FMC003 real qué claves envía Traccar (`INGEST_LOG=true`), los números de parámetro del SMS y de `setparam`, y las respuestas de los comandos; abrir `5027/TCP` en el firewall del VPS.
+
+## Conexión Smartphone (celular del chofer)
+
+El celular del chofer, con la app oficial **Traccar Client**, rastrea al chofer mientras tiene una unidad asignada. Guía: `docs/SMARTPHONE.md` y `docs/conexion-smartphone.pdf`.
+
+- **Pantalla:** Configuración de Cámaras → pestaña **Conexión Smartphone** (después de «Telemetría OBD-II»): datos para Traccar Client (Server URL `http://<host>:5055`, OsmAnd), pasos, tabla de choferes con celular, conexión, batería, última posición y origen de la posición de la unidad. Asistente de 3 pasos con identificador `GC-########`, ajustes por plataforma y «Compartir por WhatsApp».
+- **Datos:** `Driver.phoneTracker` (sin entidad nueva); `Vehicle.positionSource` (`equipo` / `smartphone`). Alta y baja automáticas en Traccar por su API.
+- **Reglas:** la última posición del celular se registra siempre en el chofer, pero solo mueve una unidad si tiene una asignada; la cámara/OBD con reporte en los últimos 3 min manda sobre el celular; se descartan fixes de más de ±100 m.
+- **Alertas:** SOS (crítica), batería baja < 15 % (una por asignación), «Celular del chofer sin señal» (> 10 min en ruta, barrido cada minuto).
+- **API:** `GET /api/phones`, `PUT|DELETE /api/drivers/:id/phone`, `POST /api/drivers/:id/phone/sync`. Simulador `npm run phone:sim`.
+- **Pendiente:** abrir `5055/TCP` en el firewall del VPS; probar con celulares reales (Android de varias marcas e iPhone) el rastreo en segundo plano y si la versión de Traccar Client envía SOS.
+
+
+## Monedas y tipos de cambio (superadmin)
+
+Detalle en [docs/MONEDAS.md](MONEDAS.md).
+
+- [x] Monedas ARS, VES, USD y CLP, administradas por el superadmin (nombre, símbolo, decimales, habilitar).
+- [x] Tipos de cambio con fecha y pivote USD, para que los cruces sean siempre consistentes, y cotización sugerida desde fuentes públicas que el superadmin confirma.
+- [x] Moneda de cada empresa, decidida por el superadmin. Al cambiarla, se elige entre convertir los importes o cambiar solo el rótulo, y queda el historial.
+- [x] Equivalente en la moneda de referencia, carga de importes en otra moneda (repuestos, mano de obra, almacén), consolidado de todas las empresas y exportaciones con la moneda.
+- [ ] Definir la moneda de las empresas existentes desde Empresas: quedan «Sin moneda» hasta que el superadmin la elige.
+- [ ] Carga automática programada de cotizaciones (hoy es manual, con la sugerencia como ayuda).

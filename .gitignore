@@ -7,3 +7,5 @@ coverage/
 .env*
 !.env.example
 .data/
+# Fichas generadas con datos de equipos de clientes (no versionar)
+docs/fichas-camaras/

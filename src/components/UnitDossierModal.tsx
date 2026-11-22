@@ -5,8 +5,6 @@ import {
   AlertTriangle,
   CalendarClock,
   CheckCircle2,
-  Download,
-  FileJson,
   Gauge,
   Wrench,
   X,
@@ -25,13 +23,14 @@ import {
   ASSET_TYPE_LABELS,
   formatRelativeTime,
   formatServiceDate,
-  downloadWithAuth,
   getServiceDateDeltaDays,
   MAINTENANCE_META,
   STATUS_META,
   suggestNextServiceDate,
 } from '../lib/api.ts';
 import { Pagination, usePagination } from './Pagination.tsx';
+import { ExportMenu } from './ExportMenu.tsx';
+import { useMoney } from '../lib/money.tsx';
 
 interface UnitDossierModalProps {
   vehicleId: string | null;
@@ -62,6 +61,7 @@ export function UnitDossierModal({
   onClose,
   onMaintenanceAdded,
 }: UnitDossierModalProps) {
+  const money = useMoney();
   const [dossier, setDossier] = useState<DossierResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -72,7 +72,7 @@ export function UnitDossierModal({
     type: 'preventivo' as MaintenanceRecord['type'],
     title: 'Servicio preventivo 250h / Revisión general',
     workshopOrTech: 'Taller Central Certificado',
-    costMxn: 6500,
+    cost: 6500,
     nextServiceDate: '',
     notes: '',
     clearFaults: true,
@@ -126,12 +126,6 @@ export function UnitDossierModal({
   );
 
   if (!vehicleId) return null;
-
-  const handleExport = (format: 'csv' | 'json') => {
-    downloadWithAuth(`/api/vehicles/${vehicleId}/export?format=${format}`, `${vehicleId}.${format}`).catch((err) =>
-      window.alert(err instanceof Error ? err.message : 'No se pudo descargar el archivo.')
-    );
-  };
 
   const handleToggleForm = () => {
     if (!showMaintForm && activeVehicle) {
@@ -210,22 +204,7 @@ export function UnitDossierModal({
           <div className="flex items-center gap-2">
             {activeVehicle && (
               <>
-                <button
-                  type="button"
-                  onClick={() => handleExport('csv')}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 cursor-pointer whitespace-nowrap"
-                >
-                  <Download className="w-3.5 h-3.5 text-sky-400" />
-                  Extraer CSV
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleExport('json')}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 cursor-pointer whitespace-nowrap"
-                >
-                  <FileJson className="w-3.5 h-3.5 text-emerald-400" />
-                  Extraer JSON
-                </button>
+                <ExportMenu url={`/api/vehicles/${vehicleId}/export`} label="Exportar ficha" fileName={`ficha-${activeVehicle.unitCode}`} />
               </>
             )}
             <button
@@ -271,6 +250,11 @@ export function UnitDossierModal({
                     <span className="font-mono tabular-nums text-slate-400">
                       Telemetría en vivo ({formatRelativeTime(activeVehicle.lastReportAt)})
                     </span>
+                    {activeVehicle.positionSource === 'smartphone' && (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] bg-sky-500/10 border border-sky-500/30 text-sky-300">
+                        Posición: {activeVehicle.positionSourceLabel ?? 'celular del chofer'}
+                      </span>
+                    )}
                   </div>
                 </div>
 
@@ -345,10 +329,19 @@ export function UnitDossierModal({
                   </div>
 
                   <div className="p-3 rounded-xl bg-[#0B1120] border border-slate-800/80">
-                    <div className="text-slate-400">Telemetría CAN / Bus Motor</div>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-slate-400">Telemetría de motor</span>
+                      {activeVehicle.telemetrySourceEngine === 'obd' ? (
+                        <span className="px-1.5 py-0.5 rounded text-[10px] bg-emerald-500/10 border border-emerald-500/30 text-emerald-300">OBD-II en vivo</span>
+                      ) : (
+                        <span className="px-1.5 py-0.5 rounded text-[10px] bg-slate-800 border border-slate-700 text-slate-400">Simulada</span>
+                      )}
+                    </div>
                     <div className="font-mono tabular-nums text-base font-semibold text-slate-100 mt-1">
                       {activeVehicle.coolantTempC} °C · {activeVehicle.fuelLevelPct}% comb
+                      {activeVehicle.batteryVoltage !== undefined ? ` · ${activeVehicle.batteryVoltage} V` : ''}
                     </div>
+                    {activeVehicle.vin && <div className="text-slate-500 font-mono mt-0.5">VIN {activeVehicle.vin}</div>}
                     <div className="text-slate-500 font-mono tabular-nums mt-0.5">
                       {activeVehicle.odometerKm.toLocaleString('es-MX')} / {activeVehicle.nextServiceKm.toLocaleString('es-MX')} km
                     </div>
@@ -481,11 +474,11 @@ export function UnitDossierModal({
                           />
                         </div>
                         <div>
-                          <label className="block text-slate-400 mb-1">Costo estimado (MXN)</label>
+                          <label className="block text-slate-400 mb-1">Costo estimado ({money.currencyOf(activeVehicle.tenantId)?.code ?? 'sin moneda'})</label>
                           <input
                             type="number"
-                            value={maintForm.costMxn}
-                            onChange={(e) => setMaintForm((p) => ({ ...p, costMxn: Number(e.target.value) }))}
+                            value={maintForm.cost}
+                            onChange={(e) => setMaintForm((p) => ({ ...p, cost: Number(e.target.value) }))}
                             className="w-full px-2.5 py-1.5 bg-[#11192C] border border-slate-800 rounded-lg text-slate-100 font-mono"
                           />
                         </div>
@@ -549,7 +542,7 @@ export function UnitDossierModal({
                             </div>
                             <div className="text-right font-mono tabular-nums text-slate-300 shrink-0">
                               <div>
-                                {m.engineHoursAtService} h · ${m.costMxn.toLocaleString('es-MX')}
+                                {m.engineHoursAtService} h · {money.fmt(m.cost, m.tenantId)}
                               </div>
                               <div className="text-slate-500">{formatRelativeTime(m.performedAt)}</div>
                             </div>

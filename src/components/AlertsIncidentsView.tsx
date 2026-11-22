@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   AlertOctagon,
   ArrowUpRight,
@@ -24,6 +24,7 @@ import {
   PRIORITY_META,
 } from '../lib/api.ts';
 import { Pagination, usePagination } from './Pagination.tsx';
+import { ExportMenu } from './ExportMenu.tsx';
 
 interface AlertsIncidentsViewProps {
   alerts: AlertEvent[];
@@ -45,6 +46,8 @@ interface AlertsIncidentsViewProps {
     autoCreateClip: boolean;
   }) => Promise<void>;
   onOpenClip: (clipId: string) => void;
+  /** Alert to show and highlight on arrival (from «En alerta» in Monitoreo en Vivo). */
+  focusAlertId?: string | null;
 }
 
 export function AlertsIncidentsView({
@@ -58,6 +61,7 @@ export function AlertsIncidentsView({
   onToggleRule,
   onCreateRule,
   onOpenClip,
+  focusAlertId,
 }: AlertsIncidentsViewProps) {
   const [tab, setTab] = useState<'alertas' | 'incidentes' | 'reglas'>('alertas');
   const [priorityFilter, setPriorityFilter] = useState<'all' | AlertPriority>('all');
@@ -84,6 +88,25 @@ export function AlertsIncidentsView({
   const alertsPagination = usePagination(filteredAlerts, `${priorityFilter}|${alerts.length}`, 5);
   const incidentsPagination = usePagination(incidents, `${incidents.length}`, 5);
   const rulesPagination = usePagination(alertRules, `${alertRules.length}`, 5);
+
+  // Coming from «En alerta»: open the queue on the page holding that alert, scroll to it and highlight it.
+  const [highlightId, setHighlightId] = useState<string | null>(null);
+  const focusedRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!focusAlertId) return;
+    const idx = alerts.findIndex((a) => a.id === focusAlertId);
+    if (idx < 0) return;
+    setTab('alertas');
+    setPriorityFilter('all');
+    alertsPagination.setPage(Math.floor(idx / 5) + 1);
+    setHighlightId(focusAlertId);
+    const t = window.setTimeout(() => setHighlightId(null), 6000);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusAlertId]);
+  useEffect(() => {
+    if (highlightId) focusedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [highlightId, alertsPagination.page]);
 
   const handleSaveIncident = async (incidentId: string) => {
     await onUpdateIncident(incidentId, { status: statusDraft, resolutionNote: noteDraft });
@@ -142,6 +165,17 @@ export function AlertsIncidentsView({
           </div>
         )}
 
+        {tab !== 'reglas' && (
+          <ExportMenu
+            url="/api/alerts/export"
+            label="Exportar alertas e incidentes"
+            params={{ priority: priorityFilter === 'all' ? undefined : priorityFilter }}
+            count={filteredAlerts.length}
+            filtered={priorityFilter !== 'all'}
+            fileName="alertas"
+          />
+        )}
+
         {tab === 'reglas' && (
           <button
             type="button"
@@ -170,7 +204,10 @@ export function AlertsIncidentsView({
                 return (
                   <div
                     key={alert.id}
-                    className="bg-[#11192C] border border-slate-800/80 rounded-xl p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4"
+                    ref={alert.id === highlightId ? focusedRef : undefined}
+                    className={`bg-[#11192C] border rounded-xl p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4 transition-colors ${
+                      alert.id === highlightId ? 'border-rose-500/70 ring-2 ring-rose-500/30' : 'border-slate-800/80'
+                    }`}
                   >
                     <div className="space-y-1">
                       <div className="flex flex-wrap items-center gap-2 text-xs">

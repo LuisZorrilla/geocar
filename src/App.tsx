@@ -1,7 +1,11 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
   BarChart3,
+  Building2,
+  Coins,
+  IdCard,
+  Cctv,
   Film,
   LogOut,
   Map as MapIcon,
@@ -23,7 +27,10 @@ import type {
   DashcamDriverProfile,
   DashcamVendorFamily,
   Device,
+  ObdCommandEntry,
   DeviceDashcamConfig,
+  DeviceUplink,
+  UnmatchedDevice,
   Incident,
   IncidentStatus,
   MaintenanceDashboardMetrics,
@@ -33,6 +40,7 @@ import type {
   PreOpChecklist,
   PreventivePlan,
   ProtocolType,
+  UnitConnection,
   PublicUser,
   RoleDefinition,
   SizingConfig,
@@ -52,22 +60,45 @@ import { AlertsIncidentsView } from './components/AlertsIncidentsView.tsx';
 import { VideoConsoleView } from './components/VideoConsoleView.tsx';
 import { ReportsSecurityView } from './components/ReportsSecurityView.tsx';
 import { SizingRoadmapView } from './components/SizingRoadmapView.tsx';
+import { CameraConfigView } from './components/CameraConfigView.tsx';
+import { TenantsView } from './components/TenantsView.tsx';
+import { DriversView } from './components/DriversView.tsx';
+import { MoneyProvider } from './lib/money.tsx';
+import { CurrenciesView } from './components/CurrenciesView.tsx';
+import { ForcePasswordChange } from './components/ForcePasswordChange.tsx';
 import { UnitDossierModal } from './components/UnitDossierModal.tsx';
 
 type NavSection =
   | 'monitoreo'
   | 'flotas'
+  | 'camaras'
   | 'alertas'
   | 'video'
   | 'reportes'
-  | 'dimensionamiento';
+  | 'dimensionamiento'
+  | 'empresas'
+  | 'monedas'
+  | 'choferes';
 
-const NAV_ITEMS: Array<{ id: NavSection; label: string; icon: typeof MapIcon; permKey: keyof ModulePermissions }> = [
+const NAV_ITEMS: Array<{
+  id: NavSection;
+  label: string;
+  icon: typeof MapIcon;
+  permKey: keyof ModulePermissions;
+  /** Visible only to the global superadmin, whatever the role permissions say. */
+  superadminOnly?: boolean;
+  /** Visible to the superadmin and to each company's admin role. */
+  driverAdminOnly?: boolean;
+}> = [
   { id: 'monitoreo', label: 'Monitoreo en Vivo', icon: MapIcon, permKey: 'monitoreo' },
   { id: 'flotas', label: 'Flotas y Maquinaria', icon: Truck, permKey: 'flotas' },
-  { id: 'alertas', label: 'Alertas e Incidentes', icon: AlertTriangle, permKey: 'alertas' },
   { id: 'video', label: 'Consola de Video', icon: Film, permKey: 'video' },
+  { id: 'alertas', label: 'Alertas e Incidentes', icon: AlertTriangle, permKey: 'alertas' },
+  { id: 'empresas', label: 'Empresas', icon: Building2, permKey: 'administracion', superadminOnly: true },
+  { id: 'monedas', label: 'Monedas', icon: Coins, permKey: 'administracion', superadminOnly: true },
+  { id: 'choferes', label: 'Choferes', icon: IdCard, permKey: 'administracion', driverAdminOnly: true },
   { id: 'reportes', label: 'Perfiles y Reportes', icon: BarChart3, permKey: 'reportes' },
+  { id: 'camaras', label: 'Configuración de Cámaras', icon: Cctv, permKey: 'dashcams_config' },
   { id: 'dimensionamiento', label: 'Dimensionamiento', icon: Server, permKey: 'dimensionamiento' },
 ];
 
@@ -78,6 +109,11 @@ export default function App() {
   const [checkingSession, setCheckingSession] = useState(true);
 
   const [activeNav, setActiveNav] = useState<NavSection>('monitoreo');
+  /** Alert to highlight when opening «Alertas e Incidentes» from «En alerta». */
+  const [focusAlertId, setFocusAlertId] = useState<string | null>(null);
+  useEffect(() => {
+    if (activeNav !== 'alertas') setFocusAlertId(null);
+  }, [activeNav]);
   const [leftCollapsed, setLeftCollapsed] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
@@ -121,6 +157,17 @@ export default function App() {
     loadTenantWorkspace();
   }, [loadTenantWorkspace]);
 
+  /** Reloads the data in place (no loading screen), so the open view keeps its state. */
+  const refreshWorkspaceSilently = useCallback(async () => {
+    try {
+      const scope = getTenantScope();
+      const url = scope ? `/api/bootstrap?scopeTenantId=${encodeURIComponent(scope)}` : '/api/bootstrap';
+      setData(await apiRequest<TenantBootstrapResponse>(url));
+    } catch {
+      /* the next regular refresh will retry */
+    }
+  }, []);
+
   const handleLoginSuccess = async (session: AuthSessionResponse) => {
     setAuthToken(session.token);
     setTenantScope(session.user.isGlobalSuperadmin ? 'all' : null);
@@ -152,6 +199,13 @@ export default function App() {
     setDossierVehicleId(null);
   };
 
+  /** Alert ids seen in the previous live tick (null until the first one). */
+  const knownAlertIds = useRef<Set<string> | null>(null);
+  useEffect(() => {
+    // Another company (or «Todas»): its alerts are not "new".
+    knownAlertIds.current = null;
+  }, [data?.tenant.id]);
+
   const handleTelemetryTick = useCallback(async () => {
     if (!data) return;
     try {
@@ -159,29 +213,43 @@ export default function App() {
         vehicles: Vehicle[];
         workOrders?: WorkOrder[];
         maintenanceDashboard?: MaintenanceDashboardMetrics;
+        alerts?: AlertEvent[];
+        incidents?: Incident[];
       }>('/api/telemetry/tick', { method: 'POST' });
-      setData((prev) =>
-        prev
-          ? {
-              ...prev,
-              vehicles: res.vehicles,
-              workOrders: res.workOrders ?? prev.workOrders,
-              maintenanceDashboard: res.maintenanceDashboard ?? prev.maintenanceDashboard,
-            }
-          : prev
-      );
+      // New critical alerts (e.g. a driver's SOS) since the previous tick get an on-screen notice.
+      let newCritical: AlertEvent | undefined;
+      if (res.alerts) {
+        const known = knownAlertIds.current;
+        if (known) newCritical = res.alerts.find((a) => !known.has(a.id) && a.priority === 'critica' && a.status === 'pendiente');
+        knownAlertIds.current = new Set(res.alerts.map((a) => a.id));
+      }
+      setData((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          vehicles: res.vehicles,
+          workOrders: res.workOrders ?? prev.workOrders,
+          maintenanceDashboard: res.maintenanceDashboard ?? prev.maintenanceDashboard,
+          alerts: res.alerts ?? prev.alerts,
+          incidents: res.incidents ?? prev.incidents,
+        };
+      });
+      if (newCritical) {
+        const a = newCritical;
+        showToast('err', `${a.ruleName} · ${a.unitCode}${a.driverName ? ` · ${a.driverName}` : ''}`);
+      }
     } catch {
       // Silent tick error
     }
   }, [data !== null]);
 
   useEffect(() => {
-    if (!livePolling || !data) return;
+    if (!livePolling || !data || data.currentUser.mustChangePassword) return;
     const id = window.setInterval(() => {
       handleTelemetryTick();
     }, 4500);
     return () => window.clearInterval(id);
-  }, [livePolling, data !== null, handleTelemetryTick]);
+  }, [livePolling, data !== null, data?.currentUser.mustChangePassword, handleTelemetryTick]);
 
   // Mutation handlers
   const handleCreateVehicle = async (payload: {
@@ -192,17 +260,22 @@ export default function App() {
     unitCode: string;
     plate: string;
     brandModel: string;
+    brand?: string;
+    model?: string;
     year: number;
     driverName: string;
-    imei: string;
+    imei?: string;
     protocol: ProtocolType;
+    connection: UnitConnection;
     deviceModel: string;
+    deviceCatalogId?: string;
+    driverId?: string;
     engineHours: number;
   }) => {
     try {
       const res = await apiRequest<{
         vehicle: Vehicle;
-        device: Device;
+        device: Device | null;
         auditLogs: AuditLog[];
       }>('/api/vehicles', { method: 'POST', body: JSON.stringify(payload) });
       setData((prev) =>
@@ -210,13 +283,20 @@ export default function App() {
           ? {
               ...prev,
               vehicles: [res.vehicle, ...prev.vehicles],
-              devices: [res.device, ...prev.devices],
+              devices: res.device ? [res.device, ...prev.devices] : prev.devices,
               auditLogs: res.auditLogs,
               sizing: { ...prev.sizing, vehiclesCount: prev.vehicles.length + 1 },
             }
           : prev
       );
-      showToast('ok', `Activo ${res.vehicle.unitCode} registrado con ${res.device.protocol}.`);
+      showToast(
+        'ok',
+        `Activo ${res.vehicle.unitCode} registrado ${
+          payload.connection === 'smartphone' ? 'con el celular del chofer' : payload.connection === 'obd' ? 'con Telemetría OBD-II' : `con ${res.device?.protocol ?? payload.protocol}`
+        }.`
+      );
+      // Assigning a driver can free the unit they drove before: reload so every view agrees.
+      if (payload.driverId) void refreshWorkspaceSilently();
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Error al registrar activo.';
       showToast('err', msg);
@@ -277,6 +357,124 @@ export default function App() {
       showToast('ok', `Driver y prestaciones aplicadas a ${res.device.unitCode}.`);
     } catch (err) {
       showToast('err', err instanceof Error ? err.message : 'Error al configurar dashcam.');
+    }
+  };
+
+  type ObdResponse = { vehicles: Vehicle[]; devices: Device[]; unmatchedDevices?: UnmatchedDevice[]; auditLogs: AuditLog[] };
+  const applyObdResponse = (res: ObdResponse) =>
+    setData((prev) =>
+      prev
+        ? {
+            ...prev,
+            vehicles: res.vehicles,
+            devices: res.devices,
+            unmatchedDevices: res.unmatchedDevices ?? prev.unmatchedDevices,
+            auditLogs: res.auditLogs,
+          }
+        : prev
+    );
+
+  /** Merges the latest state of one unit and its OBD-II tracker (polled while the wizard or detail is open). */
+  const handleRefreshObd = useCallback(async (vehicleId: string): Promise<void> => {
+    try {
+      const res = await apiRequest<{ vehicle: Vehicle; device: Device | null }>(`/api/vehicles/${vehicleId}/obd`);
+      setData((prev) => {
+        if (!prev) return prev;
+        const devices = res.device
+          ? prev.devices.some((d) => d.id === res.device!.id)
+            ? prev.devices.map((d) => (d.id === res.device!.id ? res.device! : d))
+            : [...prev.devices, res.device]
+          : prev.devices;
+        return { ...prev, vehicles: prev.vehicles.map((v) => (v.id === vehicleId ? res.vehicle : v)), devices };
+      });
+    } catch {
+      // Silent: the next poll retries.
+    }
+  }, []);
+
+  const handleSyncObd = async (vehicleId: string): Promise<boolean> => {
+    try {
+      const res = await apiRequest<ObdResponse & { device: Device }>(`/api/vehicles/${vehicleId}/obd/sync`, { method: 'POST' });
+      applyObdResponse(res);
+      const p = res.device.provisioning;
+      if (p?.status === 'error') showToast('err', p.message ?? 'Traccar no respondió.');
+      else showToast('ok', 'Equipo dado de alta en Traccar.');
+      return p?.status !== 'error';
+    } catch (err) {
+      showToast('err', err instanceof Error ? err.message : 'No se pudo dar de alta en Traccar.');
+      return false;
+    }
+  };
+
+  const handleObdCommand = async (vehicleId: string, commandId: string, option?: string): Promise<boolean> => {
+    try {
+      const res = await apiRequest<ObdResponse & { entry: ObdCommandEntry }>(`/api/vehicles/${vehicleId}/obd/commands`, {
+        method: 'POST',
+        body: JSON.stringify({ commandId, option }),
+      });
+      applyObdResponse(res);
+      showToast('ok', res.entry.status === 'en_cola' ? 'Comando en cola: se enviará cuando el equipo se conecte.' : 'Comando enviado al equipo.');
+      return true;
+    } catch (err) {
+      showToast('err', err instanceof Error ? err.message : 'No se pudo enviar el comando.');
+      // A failed send is still logged: refresh to show it.
+      void handleRefreshObd(vehicleId);
+      return false;
+    }
+  };
+
+  const handleAssignObd = async (vehicleId: string, payload: { imei: string; catalogModelId?: string; vin?: string; apn?: string }): Promise<boolean> => {
+    try {
+      const res = await apiRequest<ObdResponse & { device: Device }>(`/api/vehicles/${vehicleId}/obd`, {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      });
+      applyObdResponse(res);
+      showToast('ok', `Equipo OBD-II ${res.device.imei} asignado a ${res.device.unitCode}.`);
+      return true;
+    } catch (err) {
+      showToast('err', err instanceof Error ? err.message : 'No se pudo guardar el equipo OBD-II.');
+      return false;
+    }
+  };
+
+  const handleRemoveObd = async (vehicleId: string): Promise<boolean> => {
+    try {
+      applyObdResponse(await apiRequest<ObdResponse>(`/api/vehicles/${vehicleId}/obd`, { method: 'DELETE' }));
+      showToast('ok', 'Equipo OBD-II retirado.');
+      return true;
+    } catch (err) {
+      showToast('err', err instanceof Error ? err.message : 'No se pudo quitar el equipo OBD-II.');
+      return false;
+    }
+  };
+
+  const handleUpdateDeviceConnection = async (
+    deviceId: string,
+    payload: { terminalId: string; uplink: DeviceUplink; wifiSsid?: string }
+  ): Promise<boolean> => {
+    try {
+      const res = await apiRequest<{
+        device: Device;
+        devices: Device[];
+        unmatchedDevices?: UnmatchedDevice[];
+        auditLogs: AuditLog[];
+      }>(`/api/devices/${deviceId}/connection`, { method: 'PUT', body: JSON.stringify(payload) });
+      setData((prev) =>
+        prev
+          ? {
+              ...prev,
+              devices: res.devices,
+              unmatchedDevices: res.unmatchedDevices ?? prev.unmatchedDevices,
+              auditLogs: res.auditLogs,
+            }
+          : prev
+      );
+      showToast('ok', `Conexión de ${res.device.unitCode} actualizada.`);
+      return true;
+    } catch (err) {
+      showToast('err', err instanceof Error ? err.message : 'Error al guardar la conexión.');
+      return false;
     }
   };
 
@@ -362,8 +560,9 @@ export default function App() {
     title: string;
     workshopOrTech: string;
     scheduledDate: string;
-    parts: Array<{ sku: string; name: string; category: WorkOrderPartCategory; quantity: number; unitCostMxn: number }>;
-    laborCostMxn: number;
+    parts: Array<{ sku: string; name: string; category: WorkOrderPartCategory; quantity: number; unitCost: number; currency?: string }>;
+    laborCost: number;
+    laborCurrency?: string;
     notes: string;
     clearFaultsOnClose?: boolean;
   }) => {
@@ -398,8 +597,9 @@ export default function App() {
       workshopOrTech?: string;
       scheduledDate?: string;
       notes?: string;
-      laborCostMxn?: number;
-      parts?: Array<{ sku: string; name: string; category: WorkOrderPartCategory; quantity: number; unitCostMxn: number }>;
+      laborCost?: number;
+      laborCurrency?: string;
+      parts?: Array<{ sku: string; name: string; category: WorkOrderPartCategory; quantity: number; unitCost: number; currency?: string }>;
       clearFaultsOnClose?: boolean;
       nextServiceDate?: string;
     }
@@ -447,7 +647,7 @@ export default function App() {
     intervalHours: number;
     intervalKm: number;
     intervalDays: number;
-    estimatedCostMxn: number;
+    estimatedCost: number;
     checklistFocus: string;
   }) => {
     try {
@@ -473,7 +673,7 @@ export default function App() {
       intervalHours?: number;
       intervalKm?: number;
       intervalDays?: number;
-      estimatedCostMxn?: number;
+      estimatedCost?: number;
       checklistFocus?: string;
     }
   ) => {
@@ -583,7 +783,8 @@ export default function App() {
     unit: string;
     stockQty: number;
     minStock: number;
-    unitCostMxn: number;
+    unitCost: number;
+    unitCostCurrency?: string;
     warehouseLocation: string;
   }) => {
     try {
@@ -910,7 +1111,7 @@ export default function App() {
     return (
       <div className="min-h-screen bg-[#0B1120] text-slate-200 flex items-center justify-center p-6">
         <div className="w-full max-w-sm bg-[#11192C] border border-slate-800 rounded-xl p-6 space-y-3 text-center">
-          <div className="text-sm font-semibold text-slate-100">Vigilant FleetOps</div>
+          <div className="text-sm font-semibold text-slate-100">Vigilant GeoCar</div>
           <div className="text-xs text-slate-400">Verificando sesión de empresa...</div>
         </div>
       </div>
@@ -921,12 +1122,36 @@ export default function App() {
     return <LoginView onLoginSuccess={handleLoginSuccess} />;
   }
 
-  const visibleNavItems = NAV_ITEMS.filter((item) => data.currentRole.permissions[item.permKey] !== 'none');
+  if (data.currentUser.mustChangePassword) {
+    return (
+      <ForcePasswordChange
+        userName={data.currentUser.name}
+        username={data.currentUser.username}
+        tenantName={data.tenant.name}
+        onChanged={async () => {
+          await loadTenantWorkspace();
+          showToast('ok', 'Contraseña actualizada. ¡Bienvenido!');
+        }}
+        onLogout={handleLogout}
+      />
+    );
+  }
+
+  const isSuperadmin = Boolean(data.currentUser.isGlobalSuperadmin);
+  const isDriverAdmin = isSuperadmin || Boolean(data.currentRole.isSystemAdminRole);
+  const visibleNavItems = NAV_ITEMS.filter((item) =>
+    item.superadminOnly
+      ? isSuperadmin
+      : item.driverAdminOnly
+        ? isDriverAdmin
+        : data.currentRole.permissions[item.permKey] !== 'none'
+  );
   const pendingAlertsCount = data.alerts.filter((a) => a.status === 'pendiente').length;
   const openIncidentsCount = data.incidents.filter((i) => i.status !== 'resuelto').length;
   const currentNavLabel = NAV_ITEMS.find((n) => n.id === activeNav)?.label ?? 'Monitoreo en Vivo';
 
   return (
+    <MoneyProvider data={data}>
     <div className="min-h-screen bg-[#0B1120] text-slate-100 flex">
       {mobileMenuOpen && (
         <div className="fixed inset-0 z-40 bg-black/60 lg:hidden" onClick={() => setMobileMenuOpen(false)} />
@@ -942,7 +1167,7 @@ export default function App() {
           <div className="h-14 px-4 flex items-center justify-between border-b border-slate-800/80">
             {!leftCollapsed && (
               <span className="font-display font-bold text-base tracking-tight text-slate-100 whitespace-nowrap truncate">
-                Vigilant FleetOps
+                Vigilant GeoCar
               </span>
             )}
             <button
@@ -1115,7 +1340,10 @@ export default function App() {
               onTickNow={handleTelemetryTick}
               onRequestVideo={(vid) => handleRequestVideoStream(vid, 'dual')}
               onOpenDossier={(vid) => setDossierVehicleId(vid)}
-              onGoToAlerts={() => setActiveNav('alertas')}
+              onGoToAlerts={(alertId) => {
+                setFocusAlertId(alertId ?? null);
+                setActiveNav('alertas');
+              }}
             />
           )}
 
@@ -1129,17 +1357,12 @@ export default function App() {
               preventivePlans={data.preventivePlans}
               partsInventory={data.partsInventory}
               checklists={data.checklists}
-              dashcamDrivers={data.dashcamDrivers}
               tenant={data.tenant}
               availableTenants={data.availableTenants}
               drivers={data.drivers}
               activeRole={data.currentRole}
               isGlobalSuperadmin={data.currentUser.isGlobalSuperadmin}
               onCreateVehicle={handleCreateVehicle}
-              onValidateDevice={handleValidateDevice}
-              onUpdateDeviceConfig={handleUpdateDeviceDashcamConfig}
-              onBatchUpdateDeviceConfig={handleBatchUpdateDeviceDashcamConfig}
-              onCreateDashcamDriver={handleCreateDashcamDriver}
               onCreateWorkOrder={handleCreateWorkOrder}
               onUpdateWorkOrder={handleUpdateWorkOrder}
               onCreatePreventivePlan={handleCreatePreventivePlan}
@@ -1151,6 +1374,32 @@ export default function App() {
               onAdjustPartStock={handleAdjustPartStock}
               onCreateChecklist={handleCreateChecklist}
               onOpenDossier={(vid) => setDossierVehicleId(vid)}
+            />
+          )}
+
+          {activeNav === 'camaras' && (
+            <CameraConfigView
+              tenant={data.tenant}
+              availableTenants={data.availableTenants}
+              devices={data.devices}
+              dashcamDrivers={data.dashcamDrivers}
+              activeRole={data.currentRole}
+              isGlobalSuperadmin={data.currentUser.isGlobalSuperadmin}
+              onValidateDevice={handleValidateDevice}
+              onUpdateDeviceConfig={handleUpdateDeviceDashcamConfig}
+              onBatchUpdateDeviceConfig={handleBatchUpdateDeviceDashcamConfig}
+              onCreateDashcamDriver={handleCreateDashcamDriver}
+              deviceConnection={data.deviceConnection}
+              unmatchedDevices={data.unmatchedDevices}
+              onUpdateConnection={handleUpdateDeviceConnection}
+              vehicles={data.vehicles}
+              onAssignObd={handleAssignObd}
+              onRemoveObd={handleRemoveObd}
+              onRefreshObd={handleRefreshObd}
+              onSyncObd={handleSyncObd}
+              onObdCommand={handleObdCommand}
+              onNotify={showToast}
+              onDeviceConnectionChange={(dc) => setData((prev) => (prev ? { ...prev, deviceConnection: dc } : prev))}
             />
           )}
 
@@ -1169,6 +1418,7 @@ export default function App() {
                 setSelectedClipId(clipId);
                 setActiveNav('video');
               }}
+              focusAlertId={focusAlertId}
             />
           )}
 
@@ -1203,6 +1453,32 @@ export default function App() {
               onUpdateRole={handleUpdateRole}
               onCreateUser={handleCreateUser}
               onUpdateUser={handleUpdateUser}
+            />
+          )}
+
+          {activeNav === 'empresas' && isSuperadmin && (
+            <TenantsView
+              showToast={showToast}
+              onTenantsChanged={loadTenantWorkspace}
+              onViewTenant={async (tenantId) => {
+                await handleSwitchScope(tenantId);
+                setActiveNav('monitoreo');
+              }}
+            />
+          )}
+
+          {activeNav === 'monedas' && isSuperadmin && (
+            <CurrenciesView showToast={showToast} onChanged={() => void refreshWorkspaceSilently()} />
+          )}
+
+          {activeNav === 'choferes' && isDriverAdmin && (
+            <DriversView
+              tenant={data.tenant}
+              availableTenants={data.availableTenants}
+              vehicles={data.vehicles}
+              drivers={data.drivers}
+              phoneServerUrl={data.deviceConnection?.phoneServerUrl}
+              onDataChanged={() => void refreshWorkspaceSilently()}
             />
           )}
 
@@ -1248,5 +1524,6 @@ export default function App() {
         }}
       />
     </div>
+    </MoneyProvider>
   );
 }

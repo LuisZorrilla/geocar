@@ -3,7 +3,6 @@ import {
   Activity,
   AlertTriangle,
   Camera,
-  Download,
   MapPin,
   PanelRightClose,
   PanelRightOpen,
@@ -24,13 +23,13 @@ import type {
 import {
   ASSET_TYPE_LABELS,
   formatRelativeTime,
-  downloadWithAuth,
   LINK_META,
   MAINTENANCE_META,
   STATUS_META,
 } from '../lib/api.ts';
 import { FleetMap } from './FleetMap.tsx';
 import { Pagination, usePagination } from './Pagination.tsx';
+import { ExportMenu } from './ExportMenu.tsx';
 
 interface LiveMonitoringViewProps {
   vehicles: Vehicle[];
@@ -43,7 +42,8 @@ interface LiveMonitoringViewProps {
   onTickNow: () => void;
   onRequestVideo: (vehicleId: string) => void;
   onOpenDossier: (vehicleId: string) => void;
-  onGoToAlerts: () => void;
+  /** Opens «Alertas e Incidentes»; with an id, that alert is shown highlighted. */
+  onGoToAlerts: (alertId?: string) => void;
 }
 
 export function LiveMonitoringView({
@@ -107,13 +107,16 @@ export function LiveMonitoringView({
     5
   );
 
-  const canRequestVideo = activeRole.permissions.video === 'full' || activeRole.permissions.video === 'write';
-
-  const handleDownloadUnitCsv = (vehicleId: string) => {
-    downloadWithAuth(`/api/vehicles/${vehicleId}/export?format=csv`, `${vehicleId}.csv`).catch((err) =>
-      window.alert(err instanceof Error ? err.message : 'No se pudo descargar el archivo.')
-    );
+  /** The alert behind «En alerta»: the newest pending one of the unit, else its newest one. */
+  const alertOf = (vehicleId: string): AlertEvent | undefined => {
+    const own = alerts.filter((a) => a.vehicleId === vehicleId);
+    const newest = (list: AlertEvent[]) =>
+      list.reduce<AlertEvent | undefined>((best, a) => (!best || Date.parse(a.timestamp) > Date.parse(best.timestamp) ? a : best), undefined);
+    return newest(own.filter((a) => a.status === 'pendiente')) ?? newest(own);
   };
+  const openAlertOf = (vehicleId: string) => onGoToAlerts(alertOf(vehicleId)?.id);
+
+  const canRequestVideo = activeRole.permissions.video === 'full' || activeRole.permissions.video === 'write';
 
   return (
     <div className="space-y-5">
@@ -139,7 +142,7 @@ export function LiveMonitoringView({
             <span className="text-2xl font-semibold font-mono tabular-nums text-rose-400">{stats.pendingAlerts}</span>
             <button
               type="button"
-              onClick={onGoToAlerts}
+              onClick={() => onGoToAlerts()}
               className="text-xs text-sky-400 hover:text-sky-300 transition-colors cursor-pointer whitespace-nowrap"
             >
               Atender bandeja
@@ -234,9 +237,20 @@ export function LiveMonitoringView({
                     </div>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
-                    <span className={`text-xs font-medium whitespace-nowrap ${STATUS_META[selectedVehicle.operationalStatus].colorClass}`}>
-                      {STATUS_META[selectedVehicle.operationalStatus].label}
-                    </span>
+                    {selectedVehicle.operationalStatus === 'alerta' ? (
+                      <button
+                        type="button"
+                        onClick={() => openAlertOf(selectedVehicle.id)}
+                        title="Ver la alerta en Alertas e Incidentes"
+                        className={`text-xs font-medium whitespace-nowrap underline decoration-dotted underline-offset-2 hover:decoration-solid cursor-pointer ${STATUS_META.alerta.colorClass}`}
+                      >
+                        {STATUS_META.alerta.label}
+                      </button>
+                    ) : (
+                      <span className={`text-xs font-medium whitespace-nowrap ${STATUS_META[selectedVehicle.operationalStatus].colorClass}`}>
+                        {STATUS_META[selectedVehicle.operationalStatus].label}
+                      </span>
+                    )}
                     <button
                       type="button"
                       onClick={() => setRightCollapsed(true)}
@@ -264,7 +278,9 @@ export function LiveMonitoringView({
                     </div>
                   </div>
                   <div>
-                    <div className="text-slate-400">Combustible</div>
+                    <div className="text-slate-400">
+                      Combustible{selectedVehicle.telemetrySourceEngine === 'obd' ? <span className="text-emerald-300"> · OBD-II</span> : null}
+                    </div>
                     <div className="font-mono tabular-nums text-sm font-medium text-slate-100 mt-0.5">
                       {selectedVehicle.fuelLevelPct}% · {selectedVehicle.coolantTempC}°C
                     </div>
@@ -295,6 +311,9 @@ export function LiveMonitoringView({
                     </div>
                     <div className="text-slate-500">
                       Último reporte: {formatRelativeTime(selectedVehicle.lastReportAt)} · {selectedVehicle.geofenceName}
+                      {selectedVehicle.positionSource === 'smartphone' && (
+                        <span className="text-sky-300"> · Posición: {(selectedVehicle.positionSourceLabel ?? 'celular del chofer').toLowerCase()}</span>
+                      )}
                     </div>
                   </div>
                 )}
@@ -308,15 +327,7 @@ export function LiveMonitoringView({
                     <Wrench className="w-3.5 h-3.5" />
                     Ficha y Mantenimiento
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => handleDownloadUnitCsv(selectedVehicle.id)}
-                    className="inline-flex items-center gap-1 px-2.5 py-2 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors cursor-pointer whitespace-nowrap"
-                    title="Extraer ficha técnica CSV"
-                  >
-                    <Download className="w-3.5 h-3.5 text-sky-400" />
-                    CSV
-                  </button>
+                  <ExportMenu url={`/api/vehicles/${selectedVehicle.id}/export`} label="Ficha" fileName={`ficha-${selectedVehicle.unitCode}`} />
                   <button
                     type="button"
                     disabled={!canRequestVideo}
@@ -434,7 +445,29 @@ export function LiveMonitoringView({
                           </div>
                         </div>
                         <div className="text-right shrink-0">
-                          <div className={`text-[11px] font-medium ${meta.colorClass}`}>{meta.label}</div>
+                          {v.operationalStatus === 'alerta' ? (
+                            <span
+                              role="link"
+                              tabIndex={0}
+                              title="Ver la alerta en Alertas e Incidentes"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openAlertOf(v.id);
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  openAlertOf(v.id);
+                                }
+                              }}
+                              className={`block text-[11px] font-medium underline decoration-dotted underline-offset-2 hover:decoration-solid cursor-pointer ${meta.colorClass}`}
+                            >
+                              {meta.label}
+                            </span>
+                          ) : (
+                            <div className={`text-[11px] font-medium ${meta.colorClass}`}>{meta.label}</div>
+                          )}
                           <div className="text-[11px] font-mono tabular-nums text-slate-400 mt-0.5 inline-flex items-center gap-1">
                             <Camera className="w-3 h-3 text-slate-500" />
                             {v.engineHours}h

@@ -90,6 +90,14 @@ describe('JT808 mensajes', () => {
     assert.equal(loc.additional[1].hex, 'aabb');
   });
 
+  test('posición en hemisferio sur/oeste (San Juan, Argentina)', () => {
+    const loc = parseLocation(buildLocationBody({ latitude: -31.5375, longitude: -68.5364, speedKmh: 30 }));
+    assert.equal(loc.latitude, -31.5375);
+    assert.equal(loc.longitude, -68.5364);
+    assert.ok(loc.statusFlags & (1 << 2), 'bit de latitud sur activo');
+    assert.ok(loc.statusFlags & (1 << 3), 'bit de longitud oeste activo');
+  });
+
   test('registro 0x0100 en 2013 y 2019', () => {
     for (const version of ['2013', '2019'] as const) {
       const reg = { provinceId: 19, cityId: 39, manufacturerId: 'HOWEN', terminalModel: 'HERO-ME40', terminalId: 'T001', plateColor: 1, plate: 'NL-123' };
