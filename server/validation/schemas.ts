@@ -200,6 +200,15 @@ export const adjustStock = z.object({
   reason: text(300).optional(),
 });
 
+export const reviewChecklist = z.object({
+  decision: z.enum(['apto', 'apto_con_restriccion', 'no_apto']),
+  note: text(1000).optional(),
+  createWorkOrder: z.boolean().optional(),
+}).refine((b) => b.decision === 'apto' || Boolean(b.note?.trim()), {
+  message: 'explica la restricción o por qué la unidad no está apta',
+  path: ['note'],
+});
+
 export const createChecklist = z.object({
   vehicleId: id,
   driverName: text(120).optional(),

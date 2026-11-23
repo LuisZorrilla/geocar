@@ -927,6 +927,40 @@ async function startServer() {
     });
   });
 
+  // Supervisor review of a pre-op checklist (the inspection itself stays unchanged).
+  app.patch('/api/checklists/:id/review', (req, res) => {
+    const ctx = requireAuth(req, res);
+    if (!ctx) return;
+    if (!ctx.user.isHiddenSuperadmin && !hasWritePermission(ctx.role, 'flotas')) {
+      res.status(403).json({ error: 'Tu perfil no tiene permisos para revisar checklists pre-operativos.' });
+      return;
+    }
+    const body = parseBody(schemas.reviewChecklist, req, res);
+    if (!body) return;
+    const isSuper = Boolean(ctx.user.isHiddenSuperadmin);
+    const result = fleetStore.reviewPreOpChecklist(
+      ctx.tenant.id,
+      String(req.params.id),
+      { decision: body.decision, note: body.note ?? '', createWorkOrder: Boolean(body.createWorkOrder) },
+      ctx.user.name,
+      ctx.role.name,
+      isSuper,
+      isSuper
+    );
+    if (!result) {
+      res.status(404).json({ error: 'Checklist no encontrado en tu empresa.' });
+      return;
+    }
+    const data = fleetStore.getTenantBootstrap(ctx.tenant.id, ctx.user.id, getRequestedScope(req, ctx));
+    res.json({
+      ...result,
+      checklists: data?.checklists ?? [],
+      workOrders: data?.workOrders ?? [],
+      maintenanceDashboard: data?.maintenanceDashboard,
+      auditLogs: data?.auditLogs ?? [],
+    });
+  });
+
   // Dashcam Drivers & Capabilities Configuration (Exclusive Superadmin & Company Admin / Authorized Roles)
   app.post('/api/dashcam-drivers', (req, res) => {
     const ctx = requireAuth(req, res);

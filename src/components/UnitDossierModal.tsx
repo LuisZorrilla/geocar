@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   CalendarClock,
   CheckCircle2,
+  ClipboardCheck,
   Gauge,
   Wrench,
   X,
@@ -14,6 +15,7 @@ import type {
   Device,
   Incident,
   MaintenanceRecord,
+  PreOpChecklist,
   PreventivePlan,
   RoleDefinition,
   Vehicle,
@@ -21,6 +23,7 @@ import type {
 import {
   apiRequest,
   ASSET_TYPE_LABELS,
+  CHECKLIST_RESULT_META,
   formatRelativeTime,
   formatServiceDate,
   getServiceDateDeltaDays,
@@ -31,11 +34,15 @@ import {
 import { Pagination, usePagination } from './Pagination.tsx';
 import { ExportMenu } from './ExportMenu.tsx';
 import { useMoney } from '../lib/money.tsx';
+import { CHECKLIST_DECISION_LABELS, checklistHasFailures } from '../shared/checklist.ts';
+import { decisionClass } from './ChecklistDetailDialog.tsx';
 
 interface UnitDossierModalProps {
   vehicleId: string | null;
   liveVehicle?: Vehicle | null;
   preventivePlans?: PreventivePlan[];
+  /** Checklists already in memory (the latest of this unit is shown). */
+  checklists?: PreOpChecklist[];
   activeRole: RoleDefinition;
   onClose: () => void;
   onMaintenanceAdded: (payload: {
@@ -57,6 +64,7 @@ export function UnitDossierModal({
   vehicleId,
   liveVehicle,
   preventivePlans,
+  checklists,
   activeRole,
   onClose,
   onMaintenanceAdded,
@@ -112,6 +120,14 @@ export function UnitDossierModal({
         : undefined,
     [activeVehicle?.assignedPlanId, preventivePlans]
   );
+
+  const lastChecklist = useMemo(() => {
+    let best: PreOpChecklist | null = null;
+    for (const c of checklists ?? []) {
+      if (c.vehicleId === vehicleId && (!best || c.submittedAt > best.submittedAt)) best = c;
+    }
+    return best;
+  }, [checklists, vehicleId]);
 
   const faultPagination = usePagination(
     activeVehicle?.faultCodes ?? [],
@@ -351,6 +367,34 @@ export function UnitDossierModal({
                       </div>
                     )}
                   </div>
+                </div>
+
+                {/* Latest pre-op checklist of the unit */}
+                <div className="p-3 rounded-xl bg-[#0B1120] border border-slate-800/80 flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-slate-400 inline-flex items-center gap-2">
+                    <ClipboardCheck className="w-4 h-4 text-sky-400" /> Último checklist pre-operativo
+                  </span>
+                  {lastChecklist ? (
+                    <span className="text-slate-300">
+                      <span className="font-mono">{lastChecklist.id}</span> ·{' '}
+                      <span className={`font-medium ${CHECKLIST_RESULT_META[lastChecklist.result].colorClass}`}>
+                        {CHECKLIST_RESULT_META[lastChecklist.result].label}
+                      </span>{' '}
+                      · {lastChecklist.driverName} · {formatRelativeTime(lastChecklist.submittedAt)} ·{' '}
+                      {lastChecklist.review ? (
+                        <span className={decisionClass(lastChecklist.review.decision)}>
+                          Revisado: {CHECKLIST_DECISION_LABELS[lastChecklist.review.decision]}
+                          {lastChecklist.review.note ? ` (${lastChecklist.review.note})` : ''}
+                        </span>
+                      ) : checklistHasFailures(lastChecklist) ? (
+                        <span className="text-amber-300">Fallas sin revisar</span>
+                      ) : (
+                        <span className="text-slate-500">Sin revisión</span>
+                      )}
+                    </span>
+                  ) : (
+                    <span className="text-slate-500">Sin checklists registrados</span>
+                  )}
                 </div>
 
                 {/* Live Telemetry-Synced Fault Codes */}

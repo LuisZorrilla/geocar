@@ -28,6 +28,7 @@ import {
   STATUS_META,
 } from '../lib/api.ts';
 import { Pagination, usePagination } from './Pagination.tsx';
+import type { ReviewChecklistHandler } from '../shared/checklist.ts';
 import { MaintenanceWorkbench } from './MaintenanceWorkbench.tsx';
 import { MaintenancePanelView } from './MaintenancePanelView.tsx';
 import { RegisterAssetDrawer, type CreateVehiclePayload } from './RegisterAssetDrawer.tsx';
@@ -123,6 +124,7 @@ interface FleetDevicesViewProps {
     summaryNote: string;
     createWorkOrderIfFailed: boolean;
   }) => Promise<void>;
+  onReviewChecklist: ReviewChecklistHandler;
   onOpenDossier: (vehicleId: string) => void;
 }
 
@@ -151,6 +153,7 @@ export function FleetDevicesView({
   onUpsertPartInventory,
   onAdjustPartStock,
   onCreateChecklist,
+  onReviewChecklist,
   onOpenDossier,
 }: FleetDevicesViewProps) {
   const [subTab, setSubTab] = useState<'vehiculos' | 'mantenimiento' | 'panel' | 'conductores'>('vehiculos');
@@ -378,6 +381,7 @@ export function FleetDevicesView({
           onUpsertPartInventory={onUpsertPartInventory}
           onAdjustPartStock={onAdjustPartStock}
           onCreateChecklist={onCreateChecklist}
+          onReviewChecklist={onReviewChecklist}
           onOpenDossier={onOpenDossier}
         />
       )}

@@ -353,6 +353,17 @@ export interface PreOpChecklist {
   summaryNote: string;
   linkedWorkOrderId?: string;
   submittedAt: string;
+  /** Supervisor review. The inspection itself (items, result) is never modified: it is the evidence. */
+  review?: ChecklistReview;
+}
+
+export type ChecklistReviewDecision = 'apto' | 'apto_con_restriccion' | 'no_apto';
+
+export interface ChecklistReview {
+  decision: ChecklistReviewDecision;
+  note: string;
+  reviewedBy: string;
+  reviewedAt: string;
 }
 
 export interface DashcamDriverProfile {

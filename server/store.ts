@@ -13,6 +13,7 @@ import { composeBrandModel } from '../src/shared/vehicleCatalog.ts';
 import { DriverRegistry } from './drivers/registry.ts';
 import { CurrencyService } from './currency/service.ts';
 import { BASE_CURRENCIES, formatMoney } from '../src/shared/currency.ts';
+import { CHECKLIST_DECISION_LABELS } from '../src/shared/checklist.ts';
 import {
   newPhoneIdentifier,
   PHONE_DEVICE_PRIORITY_MS,
@@ -27,6 +28,7 @@ import type {
   AssetType,
   AuditLog,
   ChecklistItem,
+  ChecklistReviewDecision,
   DashcamDriverProfile,
   Device,
   DeviceConnectionSettings,
@@ -4958,7 +4960,7 @@ class FleetStore {
           workshopOrTech: 'Taller Central Certificado',
           scheduledDate: new Date().toISOString().slice(0, 10),
           parts: [],
-          laborCost: 1400,
+          laborCost: 0,
           notes: input.summaryNote || `Hallazgos en checklist turno ${input.shift}.`,
           clearFaultsOnClose: false,
         },
@@ -4997,6 +4999,77 @@ class FleetStore {
       action: `Inspección ${result}`,
       targetLabel: `${checklist.id} · ${vehicle.unitCode}`,
       detail: `${failedItems.length} hallazgo(s) en turno ${checklist.shift}${linkedOrder ? ` · Generó ${linkedOrder.id}` : ''}.`,
+    });
+    this.persist(this.state);
+    return { checklist, workOrder: linkedOrder };
+  }
+
+  /**
+   * Supervisor review of a pre-op checklist. Items and result are never touched (they are the
+   * inspection evidence); a new review replaces the previous one and both stay in the audit log.
+   * Optionally creates the corrective work order when the checklist had failures and none was generated.
+   */
+  reviewPreOpChecklist(
+    tenantId: string,
+    checklistId: string,
+    input: { decision: ChecklistReviewDecision; note: string; createWorkOrder?: boolean },
+    actorName: string,
+    actorRole: string,
+    allowAllTenants = false,
+    actorHidden = false
+  ): { checklist: PreOpChecklist; workOrder?: WorkOrder } | null {
+    const checklist = this.state.checklists.find(
+      (c) => c.id === checklistId && (allowAllTenants || c.tenantId === tenantId)
+    );
+    if (!checklist) return null;
+
+    const failedItems = checklist.items.filter((it) => it.status === 'falla');
+    let linkedOrder: WorkOrder | undefined;
+    if (input.createWorkOrder && failedItems.length > 0 && !checklist.linkedWorkOrderId) {
+      const created = this.createWorkOrder(
+        checklist.tenantId,
+        {
+          vehicleId: checklist.vehicleId,
+          type: 'correctivo',
+          priority: failedItems.length >= 2 || input.decision === 'no_apto' ? 'critica' : 'alta',
+          title: `Correctivo pre-operativo (${failedItems.map((f) => f.label).slice(0, 2).join('; ')})`,
+          workshopOrTech: 'Taller Central Certificado',
+          scheduledDate: new Date().toISOString().slice(0, 10),
+          parts: [],
+          laborCost: 0,
+          notes: `Generada en la revisión de ${checklist.id}. ${input.note.trim()}`.trim(),
+          clearFaultsOnClose: false,
+        },
+        actorName,
+        actorRole,
+        true,
+        actorHidden
+      );
+      if (created) {
+        linkedOrder = created;
+        checklist.linkedWorkOrderId = created.id;
+      }
+    }
+
+    const previous = checklist.review;
+    checklist.review = {
+      decision: input.decision,
+      note: input.note.trim(),
+      reviewedBy: actorName,
+      reviewedAt: new Date().toISOString(),
+    };
+    const label = CHECKLIST_DECISION_LABELS[input.decision];
+    this.addAuditLog({
+      tenantId: checklist.tenantId,
+      actorName,
+      actorRole,
+      actorHidden,
+      module: 'Checklist Pre-Operativo',
+      action: previous ? 'Revisión corregida' : 'Checklist revisado',
+      targetLabel: `${checklist.id} · ${checklist.unitCode}`,
+      detail: `${previous ? `${CHECKLIST_DECISION_LABELS[previous.decision]} → ` : ''}${label}${
+        input.note.trim() ? ` · ${input.note.trim()}` : ''
+      }${linkedOrder ? ` · Generó ${linkedOrder.id}` : ''}.`,
     });
     this.persist(this.state);
     return { checklist, workOrder: linkedOrder };

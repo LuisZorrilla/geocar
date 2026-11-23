@@ -45,6 +45,8 @@ import { Pagination, usePagination } from './Pagination.tsx';
 import { MaintenanceDashboardView } from './MaintenanceDashboardView.tsx';
 import { ExportMenu } from './ExportMenu.tsx';
 import { Money, useMoney } from '../lib/money.tsx';
+import { checklistHasFailures, checklistNeedsReview, CHECKLIST_DECISION_LABELS, type ReviewChecklistHandler } from '../shared/checklist.ts';
+import { ChecklistDetailDialog, decisionClass } from './ChecklistDetailDialog.tsx';
 
 /** Currency of an amount: empty = the company's; any other enabled currency is converted on the server. */
 function CurrencySelect({
@@ -180,6 +182,7 @@ interface MaintenanceWorkbenchProps {
     summaryNote: string;
     createWorkOrderIfFailed: boolean;
   }) => Promise<void>;
+  onReviewChecklist: ReviewChecklistHandler;
   onOpenDossier: (vehicleId: string) => void;
 }
 
@@ -212,6 +215,7 @@ export function MaintenanceWorkbench({
   onUpsertPartInventory,
   onAdjustPartStock,
   onCreateChecklist,
+  onReviewChecklist,
   onOpenDossier,
 }: MaintenanceWorkbenchProps) {
   const money = useMoney();
@@ -441,7 +445,17 @@ export function MaintenanceWorkbench({
   const totalWorkOrders = workOrders
     .filter((w) => w.status !== 'cancelada')
     .reduce((sum, w) => sum + w.totalCost * (money.toScope(w.tenantId, w.completedAt || w.createdAt) ?? 0), 0);
-  const flaggedChecklistsCount = checklists.filter((c) => c.result !== 'aprobado').length;
+  const checklistsToReview = useMemo(() => checklists.filter(checklistNeedsReview), [checklists]);
+  const checklistsWithFailures = checklists.filter(checklistHasFailures).length;
+  const [openChecklistId, setOpenChecklistId] = useState<string | null>(null);
+  /** Jumps to a work order in the Orders tab (clearing filters so it's visible). */
+  const openOrder = (woId: string) => {
+    setStatusFilter('all');
+    setPriorityFilter('all');
+    setSelectedOrderId(woId);
+    setTab('ordenes');
+  };
+  const openChecklist = openChecklistId ? checklists.find((c) => c.id === openChecklistId) ?? null : null;
   const lowStockItems = useMemo(
     () => partsInventory.filter((i) => i.stockQty <= i.minStock),
     [partsInventory]
@@ -714,11 +728,13 @@ export function MaintenanceWorkbench({
         vehicleId: chkVehicleId,
         driverName: chkDriverName,
         shift: chkShift,
-        items: chkItems,
+        // The per-item note only applies to failures.
+        items: chkItems.map(({ note, ...it }) => (it.status === 'falla' && note?.trim() ? { ...it, note: note.trim() } : it)),
         summaryNote: chkSummary,
         createWorkOrderIfFailed: chkAutoWo,
       });
       setChkSummary('');
+      setChkItems((prev) => prev.map(({ note: _note, ...it }) => ({ ...it, status: 'ok' })));
       setShowNewChecklist(false);
     } finally {
       setSavingChk(false);
@@ -758,7 +774,7 @@ export function MaintenanceWorkbench({
                     : `Almacén (${partsInventory.length})`,
               },
               { id: 'checklists', label: `Checklists pre-op (${checklists.length})` },
-              { id: 'pendientes', label: `Por atender (${maintenancePending.length})` },
+              { id: 'pendientes', label: `Por atender (${maintenancePending.length + checklistsToReview.length})` },
               { id: 'bitacora', label: `Bitácora (${maintenanceRecords.length})` },
             ] as const
           ).map((item) => (
@@ -855,11 +871,11 @@ export function MaintenanceWorkbench({
             </div>
           </div>
           <div className="bg-[#11192C] border border-slate-800/80 rounded-xl p-3.5">
-            <div className="text-xs text-slate-400">Checklists / Stock almacén</div>
+            <div className="text-xs text-slate-400">Checklists con fallas / Stock almacén</div>
             <div className="text-xl font-semibold font-mono tabular-nums text-rose-400 mt-1">
-              {flaggedChecklistsCount}{' '}
+              {checklistsToReview.length}{' '}
               <span className="text-xs font-normal text-slate-400">
-                hallazgos · {lowStockItems.length} SKU mín.
+                sin revisar de {checklistsWithFailures} · {lowStockItems.length} SKU mín.
               </span>
             </div>
           </div>
@@ -2316,6 +2332,19 @@ export function MaintenanceWorkbench({
                     className="p-2.5 rounded-lg bg-[#0B1120] border border-slate-800 flex flex-wrap items-center justify-between gap-2"
                   >
                     <span className="text-slate-200">{item.label}</span>
+                    {item.status === 'falla' && (
+                      <input
+                        type="text"
+                        maxLength={1000}
+                        aria-label={`Detalle de la falla: ${item.label}`}
+                        placeholder="¿Qué se encontró? (opcional)"
+                        value={item.note ?? ''}
+                        onChange={(e) =>
+                          setChkItems((prev) => prev.map((it, i) => (i === idx ? { ...it, note: e.target.value } : it)))
+                        }
+                        className="flex-1 min-w-[180px] px-2.5 py-1 bg-[#11192C] border border-rose-500/40 rounded text-slate-100"
+                      />
+                    )}
                     <div className="flex items-center gap-1.5">
                       {(['ok', 'falla', 'na'] as ChecklistItemStatus[]).map((st) => (
                         <button
@@ -2388,9 +2417,14 @@ export function MaintenanceWorkbench({
                     const resMeta = CHECKLIST_RESULT_META[chk.result];
                     const failedCount = chk.items.filter((i) => i.status === 'falla').length;
                     return (
-                      <tr key={chk.id} className="hover:bg-slate-800/30">
+                      <tr
+                        key={chk.id}
+                        className="hover:bg-slate-800/30 cursor-pointer"
+                        onClick={() => setOpenChecklistId(chk.id)}
+                        title="Ver detalle y revisión"
+                      >
                         <td className="py-2.5 px-4">
-                          <div className="font-mono font-semibold text-slate-100">{chk.id}</div>
+                          <div className="font-mono font-semibold text-sky-300 hover:underline">{chk.id}</div>
                           <div className="text-slate-400">
                             {chk.unitCode} · {ASSET_TYPE_LABELS[chk.assetType]}
                           </div>
@@ -2410,11 +2444,28 @@ export function MaintenanceWorkbench({
                               `${failedCount} punto(s) con falla`
                             )}
                           </div>
+                          {chk.review ? (
+                            <div className="text-slate-400">
+                              Revisado: <span className={decisionClass(chk.review.decision)}>{CHECKLIST_DECISION_LABELS[chk.review.decision]}</span> ·{' '}
+                              {chk.review.reviewedBy}
+                            </div>
+                          ) : failedCount > 0 ? (
+                            <div className="text-amber-300">Sin revisar</div>
+                          ) : null}
                         </td>
                         <td className="py-2.5 px-4 text-slate-300">
                           <div>{chk.summaryNote}</div>
                           {chk.linkedWorkOrderId && (
-                            <div className="font-mono text-sky-400">Generó OT: {chk.linkedWorkOrderId}</div>
+                            <button
+                              type="button"
+                              className="font-mono text-sky-400 hover:underline cursor-pointer"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openOrder(chk.linkedWorkOrderId!);
+                              }}
+                            >
+                              Generó OT: {chk.linkedWorkOrderId}
+                            </button>
                           )}
                         </td>
                         <td className="py-2.5 px-4 text-right font-mono tabular-nums text-slate-300">
@@ -2438,6 +2489,39 @@ export function MaintenanceWorkbench({
       )}
 
       {/* TAB 5: PENDING UNITS */}
+      {tab === 'pendientes' && checklistsToReview.length > 0 && (
+        <div className="bg-[#11192C] border border-amber-500/30 rounded-xl overflow-hidden mb-4">
+          <div className="px-4 py-2.5 border-b border-slate-800 text-xs font-medium text-amber-300 flex items-center gap-2">
+            <ClipboardCheck className="w-4 h-4" /> Checklists con fallas sin revisar ({checklistsToReview.length})
+          </div>
+          <ul className="divide-y divide-slate-800/60 text-xs">
+            {checklistsToReview.map((chk) => {
+              const failed = chk.items.filter((i) => i.status === 'falla');
+              return (
+                <li key={chk.id} className="px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 hover:bg-slate-800/30">
+                  <div>
+                    <div className="text-slate-100">
+                      <span className="font-mono font-semibold">{chk.unitCode}</span> ·{' '}
+                      <span className={CHECKLIST_RESULT_META[chk.result].colorClass}>{CHECKLIST_RESULT_META[chk.result].label}</span> ·{' '}
+                      {chk.driverName} · {formatRelativeTime(chk.submittedAt)}
+                    </div>
+                    <div className="text-rose-300">{failed.map((f) => f.label).join(' · ')}</div>
+                    <div className="text-slate-500">{chk.linkedWorkOrderId ? `OT ${chk.linkedWorkOrderId}` : 'Sin orden de trabajo'}</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setOpenChecklistId(chk.id)}
+                    className="px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-medium cursor-pointer"
+                  >
+                    {canWriteFleet ? 'Revisar' : 'Ver'}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+
       {tab === 'pendientes' && (
         <div className="bg-[#11192C] border border-slate-800/80 rounded-xl overflow-hidden">
           <div className="overflow-x-auto">
@@ -2533,6 +2617,24 @@ export function MaintenanceWorkbench({
             onPageChange={recordsPagination.setPage}
           />
         </div>
+      )}
+
+      {openChecklist && (
+        <ChecklistDetailDialog
+          key={openChecklist.id}
+          checklist={openChecklist}
+          canReview={canWriteFleet}
+          onReview={onReviewChecklist}
+          onClose={() => setOpenChecklistId(null)}
+          onOpenOrder={(woId) => {
+            setOpenChecklistId(null);
+            openOrder(woId);
+          }}
+          onOpenDossier={(vid) => {
+            setOpenChecklistId(null);
+            onOpenDossier(vid);
+          }}
+        />
       )}
     </div>
   );

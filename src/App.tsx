@@ -67,6 +67,7 @@ import { MoneyProvider } from './lib/money.tsx';
 import { CurrenciesView } from './components/CurrenciesView.tsx';
 import { ForcePasswordChange } from './components/ForcePasswordChange.tsx';
 import { UnitDossierModal } from './components/UnitDossierModal.tsx';
+import type { ReviewChecklistHandler } from './shared/checklist.ts';
 
 type NavSection =
   | 'monitoreo'
@@ -876,6 +877,39 @@ export default function App() {
     }
   };
 
+  /** Returns true when the review was saved (the dialog closes only then). */
+  const handleReviewChecklist: ReviewChecklistHandler = async (checklistId, payload) => {
+    try {
+      const res = await apiRequest<{
+        checklist: PreOpChecklist;
+        workOrder?: WorkOrder;
+        checklists: PreOpChecklist[];
+        workOrders: WorkOrder[];
+        maintenanceDashboard?: MaintenanceDashboardMetrics;
+        auditLogs: AuditLog[];
+      }>(`/api/checklists/${encodeURIComponent(checklistId)}/review`, { method: 'PATCH', body: JSON.stringify(payload) });
+      setData((prev) =>
+        prev
+          ? {
+              ...prev,
+              checklists: res.checklists,
+              workOrders: res.workOrders,
+              maintenanceDashboard: res.maintenanceDashboard ?? prev.maintenanceDashboard,
+              auditLogs: res.auditLogs,
+            }
+          : prev
+      );
+      showToast(
+        'ok',
+        res.workOrder ? `Checklist ${res.checklist.id} revisado · Generó ${res.workOrder.id}.` : `Checklist ${res.checklist.id} revisado.`
+      );
+      return true;
+    } catch (err) {
+      showToast('err', err instanceof Error ? err.message : 'Error al revisar el checklist.');
+      return false;
+    }
+  };
+
   const handleAcknowledgeAlert = async (alertId: string) => {
     try {
       const res = await apiRequest<{ alert: AlertEvent; vehicles: Vehicle[]; auditLogs: AuditLog[] }>(
@@ -1373,6 +1407,7 @@ export default function App() {
               onUpsertPartInventory={handleUpsertPartInventory}
               onAdjustPartStock={handleAdjustPartStock}
               onCreateChecklist={handleCreateChecklist}
+              onReviewChecklist={handleReviewChecklist}
               onOpenDossier={(vid) => setDossierVehicleId(vid)}
             />
           )}
@@ -1498,6 +1533,7 @@ export default function App() {
         vehicleId={dossierVehicleId}
         liveVehicle={dossierVehicleId ? data.vehicles.find((v) => v.id === dossierVehicleId) ?? null : null}
         preventivePlans={data.preventivePlans}
+        checklists={data.checklists}
         activeRole={data.currentRole}
         onClose={() => setDossierVehicleId(null)}
         onMaintenanceAdded={async ({ vehicle, maintenanceRecords }) => {
