@@ -104,17 +104,17 @@ export function MaintenanceAuditPdfModal({
     let insumosMxn = 0;
     let manoObraMxn = 0;
     for (const wo of filteredOrders) {
-      let labor = Number(wo.laborCostMxn || 0);
+      let labor = Number(wo.laborCost || 0);
       for (const p of wo.parts) {
-        if (p.category === 'refaccion') refaccionesMxn += Number(p.subtotalMxn || 0);
-        else if (p.category === 'insumo') insumosMxn += Number(p.subtotalMxn || 0);
-        else labor += Number(p.subtotalMxn || 0);
+        if (p.category === 'refaccion') refaccionesMxn += Number(p.subtotal || 0);
+        else if (p.category === 'insumo') insumosMxn += Number(p.subtotal || 0);
+        else labor += Number(p.subtotal || 0);
       }
       manoObraMxn += labor;
     }
 
     const totalWorkOrdersMxn = refaccionesMxn + insumosMxn + manoObraMxn;
-    const totalLogbookMxn = filteredRecords.reduce((s, r) => s + Number(r.costMxn || 0), 0);
+    const totalLogbookMxn = filteredRecords.reduce((s, r) => s + Number(r.cost || 0), 0);
 
     return {
       closedOrdersCount: filteredOrders.length,

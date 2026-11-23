@@ -15,6 +15,7 @@ import {
   AUTH_STATE_LABELS,
   computeDriverAuthorization,
   cuilProblem,
+  daysUntil,
   DOC_TYPES,
   DRIVER_FILE_MAX_BYTES,
   DRIVER_PAGE_SIZES,
@@ -623,6 +624,13 @@ export class DriverRegistry {
       if (d.lastAuthState === auth.state) continue;
       const v = this.vehicleOf(d);
       if (auth.state === 'no_autorizado' && d.lastAuthState && d.lastAuthState !== 'no_autorizado' && v) {
+        // When the cause is the expired license, an active "Vigencia de licencia" rule of the
+        // company names and prioritizes the alert.
+        const license = d.documents?.find((doc) => doc.type === 'licencia');
+        const licenseExpired = Boolean(license?.expiresAt && daysUntil(license.expiresAt, today) < 0);
+        const rule = licenseExpired
+          ? (this.state.alertRules ?? []).find((r) => r.tenantId === d.tenantId && r.conditionType === 'licencia_vencimiento' && r.active)
+          : undefined;
         const alert: AlertEvent = {
           id: `alr-${uid()}`,
           tenantId: d.tenantId,
@@ -630,9 +638,9 @@ export class DriverRegistry {
           unitCode: v.unitCode,
           plate: v.plate,
           driverName: d.name,
-          ruleId: 'driver-authorization',
-          ruleName: 'Chofer no autorizado',
-          priority: 'alta',
+          ruleId: rule?.id ?? 'driver-authorization',
+          ruleName: rule?.name ?? 'Chofer no autorizado',
+          priority: rule?.priority ?? 'alta',
           status: 'pendiente',
           lat: v.lat,
           lng: v.lng,

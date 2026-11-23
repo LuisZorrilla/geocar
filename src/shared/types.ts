@@ -622,7 +622,8 @@ export interface AlertRule {
   id: string;
   tenantId: string;
   name: string;
-  conditionType: 'velocidad' | 'geocerca' | 'fatiga_dms' | 'colision_g' | 'desconexion_cam' | 'panico';
+  /** licencia_vencimiento: names and prioritizes the alert raised when an assigned driver's license expires. */
+  conditionType: 'velocidad' | 'geocerca' | 'fatiga_dms' | 'colision_g' | 'desconexion_cam' | 'panico' | 'licencia_vencimiento';
   thresholdLabel: string;
   priority: AlertPriority;
   autoCreateClip: boolean;
@@ -840,3 +841,52 @@ export interface TenantBootstrapResponse {
   /** Only for the global superadmin. */
   unmatchedDevices?: UnmatchedDevice[];
 }
+
+// ── Vigiant (PWA tracker that reports over the OsmAnd protocol) ──────────────
+
+export type VigiantAccuracyLevel = 'highest' | 'high' | 'medium' | 'low';
+
+export interface VigiantConfig {
+  deviceId: string;
+  /** OsmAnd endpoint, e.g. https://host/api/osmand */
+  serverUrl: string;
+  accuracy: VigiantAccuracyLevel;
+  intervalSec: number;
+  distanceMeters: number;
+  angleDegrees: number;
+  stationaryHeartbeatSec: number;
+  fastestIntervalSec: number;
+  offlineBuffer: boolean;
+  wakeLock: boolean;
+  stopDetection: boolean;
+  serviceEnabled: boolean;
+}
+
+export interface VigiantLogEntry {
+  id: string;
+  timestamp: string;
+  level: 'info' | 'ok' | 'warn' | 'error' | 'sos';
+  message: string;
+  httpStatus?: number;
+  detail?: string;
+}
+
+/** One OsmAnd fix (speed in knots, timestamp in ms). */
+export interface VigiantTelemetryPayload {
+  id: string;
+  lat: number;
+  lon: number;
+  timestamp: number;
+  speed: number;
+  bearing: number;
+  altitude: number;
+  accuracy: number;
+  batt: number;
+  charge: boolean;
+  valid: boolean;
+  alarm?: string;
+}
+
+// ── Driver license validity (DriverLicenseModal / LICENSE_STATUS_META) ───────
+
+export type LicenseValidityStatus = 'vigente' | 'por_vencer_30' | 'por_vencer_15' | 'por_vencer_5' | 'vencida';

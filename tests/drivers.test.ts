@@ -91,6 +91,37 @@ describe('reglas de habilitación (unitarias)', () => {
     assert.equal(state.alerts[0].vehicleId, 'v1');
     assert.equal(reg.sweep(in10Days), 0, 'no repite la alerta');
   });
+
+  test('con una regla activa «Vigencia de licencia», la alerta por licencia vencida toma su nombre y prioridad', () => {
+    const driver = (id: string, docs: DriverDocument[]) => ({
+      id, tenantId: 't1', branch: 'A', name: id, licenseNumber: '1', phone: '1', status: 'activo', profile: 'profesional', licenseClasses: ['E.1'], documents: docs, lastAuthState: 'por_vencer',
+    });
+    // d1: vence la licencia. d2: vence el psicofísico (la licencia sigue vigente) → alerta genérica.
+    const psicoExpiring = professionalDocs().map((d) => (d.type === 'psicofisico' ? { ...d, expiresAt: plusDays(5) } : d));
+    const state: any = {
+      tenants: [{ id: 't1', name: 'T', branches: ['A'] }],
+      vehicles: [
+        { id: 'v1', tenantId: 't1', unitCode: 'U-1', plate: 'AA1', driverId: 'd1', lat: 0, lng: 0, speedKmh: 0 },
+        { id: 'v2', tenantId: 't1', unitCode: 'U-2', plate: 'AA2', driverId: 'd2', lat: 0, lng: 0, speedKmh: 0 },
+      ],
+      drivers: [driver('d1', professionalDocs(5)), driver('d2', psicoExpiring)],
+      alertRules: [
+        { id: 'rul-lic', tenantId: 't1', name: 'Licencia vencida', conditionType: 'licencia_vencimiento', thresholdLabel: 'Al vencer', priority: 'critica', active: true },
+        { id: 'rul-off', tenantId: 't2', name: 'Otra empresa', conditionType: 'licencia_vencimiento', thresholdLabel: '-', priority: 'media', active: true },
+      ],
+      alerts: [],
+    };
+    const reg = new DriverRegistry(() => ({ state, repo: {} as any, audit: () => {}, persist: () => {} }));
+    const in10Days = new Date();
+    in10Days.setDate(in10Days.getDate() + 10);
+    assert.equal(reg.sweep(in10Days), 2);
+    const byVehicle = Object.fromEntries(state.alerts.map((a: any) => [a.vehicleId, a]));
+    assert.equal(byVehicle.v1.ruleId, 'rul-lic');
+    assert.equal(byVehicle.v1.ruleName, 'Licencia vencida');
+    assert.equal(byVehicle.v1.priority, 'critica');
+    assert.equal(byVehicle.v2.ruleName, 'Chofer no autorizado');
+    assert.equal(byVehicle.v2.priority, 'alta');
+  });
 });
 
 // ---------------------------------------------------------------- API

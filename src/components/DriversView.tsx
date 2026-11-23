@@ -36,6 +36,7 @@ import {
 import { AuthBadge, ExpiryText } from './DriverBadges.tsx';
 import { DriverWizard } from './DriverWizard.tsx';
 import { DriverDetailPanel } from './DriverDetailPanel.tsx';
+import { DriverLicenseModal } from './DriverLicenseModal.tsx';
 import { DocumentReviewDialog } from './DocumentReviewDialog.tsx';
 import { ExportMenu } from './ExportMenu.tsx';
 
@@ -78,6 +79,7 @@ export function DriversView({ tenant, availableTenants, vehicles, drivers, phone
   const [disabling, setDisabling] = useState<DriverListItem | null>(null);
   const [enabling, setEnabling] = useState<DriverListItem | null>(null);
   const [reviewing, setReviewing] = useState<DriverListItem | null>(null);
+  const [renewing, setRenewing] = useState<DriverListItem | null>(null);
   const requestSeq = useRef(0);
 
   const showAll = tenant.id === 'all';
@@ -419,6 +421,9 @@ export function DriversView({ tenant, availableTenants, vehicles, drivers, phone
                                   <ShieldCheck className="w-3.5 h-3.5" /> Verificar
                                 </button>
                               )}
+                              <button type="button" onClick={() => setRenewing(d)} className="p-1.5 rounded-md text-slate-400 hover:text-sky-300 hover:bg-sky-500/10 cursor-pointer" aria-label={`Renovar licencia de ${d.name}`} title="Renovar licencia">
+                                <IdCard className="w-3.5 h-3.5" />
+                              </button>
                               <button type="button" onClick={() => setWizard({ mode: 'edit', driver: d })} className="p-1.5 rounded-md text-slate-400 hover:text-sky-300 hover:bg-sky-500/10 cursor-pointer" aria-label={`Editar a ${d.name}`} title="Editar">
                                 <Pencil className="w-3.5 h-3.5" />
                               </button>
@@ -557,6 +562,18 @@ export function DriversView({ tenant, availableTenants, vehicles, drivers, phone
           onDisable={() => setDisabling(detail)}
           onEnable={() => setEnabling(detail)}
           onReview={() => setReviewing(detail)}
+        />
+      )}
+
+      {renewing && (
+        <DriverLicenseModal
+          driver={renewing}
+          canWrite
+          onClose={() => setRenewing(null)}
+          onDone={(d, msg, tone) => {
+            setRenewing(null);
+            void applyChange(d, msg, tone);
+          }}
         />
       )}
 

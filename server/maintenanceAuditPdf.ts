@@ -120,19 +120,19 @@ export async function generateMaintenanceAuditPdf(
   let stockDeductedCount = 0;
 
   for (const wo of input.closedWorkOrders) {
-    let woManoObra = Number(wo.laborCostMxn || 0);
+    let woManoObra = Number(wo.laborCost || 0);
     for (const part of wo.parts) {
       totalPartsQty += Number(part.quantity || 0);
-      if (part.category === 'refaccion') refaccionesMxn += Number(part.subtotalMxn || 0);
-      else if (part.category === 'insumo') insumosMxn += Number(part.subtotalMxn || 0);
-      else woManoObra += Number(part.subtotalMxn || 0);
+      if (part.category === 'refaccion') refaccionesMxn += Number(part.subtotal || 0);
+      else if (part.category === 'insumo') insumosMxn += Number(part.subtotal || 0);
+      else woManoObra += Number(part.subtotal || 0);
     }
     manoObraMxn += woManoObra;
     if (wo.stockDeducted) stockDeductedCount += 1;
   }
 
   const totalWorkOrdersMxn = refaccionesMxn + insumosMxn + manoObraMxn;
-  const totalLogbookMxn = input.maintenanceRecords.reduce((sum, r) => sum + Number(r.costMxn || 0), 0);
+  const totalLogbookMxn = input.maintenanceRecords.reduce((sum, r) => sum + Number(r.cost || 0), 0);
 
   const canonicalDigestPayload = {
     auditFolio,
@@ -159,14 +159,14 @@ export async function generateMaintenanceAuditPdf(
       id: wo.id,
       unitCode: wo.unitCode,
       completedAt: wo.completedAt ?? wo.scheduledDate,
-      totalCostMxn: wo.totalCostMxn,
+      totalCost: wo.totalCost,
       partsCount: wo.parts.length,
     })),
     maintenanceRecords: input.maintenanceRecords.map((r) => ({
       id: r.id,
       unitCode: r.unitCode,
       performedAt: r.performedAt,
-      costMxn: r.costMxn,
+      cost: r.cost,
     })),
   };
 
@@ -510,7 +510,7 @@ export async function generateMaintenanceAuditPdf(
           .font('Helvetica-Bold')
           .fontSize(8.5)
           .fillColor(COLORS.emerald)
-          .text(fmtMxn(wo.totalCostMxn), marginL + 410, cardStartY + 5, {
+          .text(fmtMxn(wo.totalCost), marginL + 410, cardStartY + 5, {
             width: contentW - 418,
             align: 'right',
           });
@@ -579,9 +579,9 @@ export async function generateMaintenanceAuditPdf(
               { width: 65, lineBreak: false }
             );
             doc.text(String(part.quantity), tblX + 354, curY + 3, { width: 35, align: 'right', lineBreak: false });
-            doc.text(fmtMxn(part.unitCostMxn), tblX + 392, curY + 3, { width: 58, align: 'right', lineBreak: false });
+            doc.text(fmtMxn(part.unitCost), tblX + 392, curY + 3, { width: 58, align: 'right', lineBreak: false });
             doc.font('Helvetica-Bold').fillColor(COLORS.ink);
-            doc.text(fmtMxn(part.subtotalMxn), tblX + 454, curY + 3, {
+            doc.text(fmtMxn(part.subtotal), tblX + 454, curY + 3, {
               width: tblW - 458,
               align: 'right',
               lineBreak: false,
@@ -596,7 +596,7 @@ export async function generateMaintenanceAuditPdf(
           .fontSize(7.5)
           .fillColor(COLORS.slate)
           .text(
-            `Desglose OT: Refacciones/Insumos ${fmtMxn(wo.partsCostMxn)} + Mano de obra ${fmtMxn(wo.laborCostMxn)} = ${fmtMxn(wo.totalCostMxn)}`,
+            `Desglose OT: Refacciones/Insumos ${fmtMxn(wo.partsCost)} + Mano de obra ${fmtMxn(wo.laborCost)} = ${fmtMxn(wo.totalCost)}`,
             marginL + 8,
             curY + 3,
             { width: contentW - 16 }
@@ -668,8 +668,8 @@ export async function generateMaintenanceAuditPdf(
         const unitClosedWos = input.closedWorkOrders.filter((w) => w.vehicleId === veh.id);
         const unitTotalMxn =
           unitClosedWos.length > 0
-            ? unitClosedWos.reduce((s, w) => s + w.totalCostMxn, 0)
-            : unitRecs.reduce((s, r) => s + r.costMxn, 0);
+            ? unitClosedWos.reduce((s, w) => s + w.totalCost, 0)
+            : unitRecs.reduce((s, r) => s + r.cost, 0);
 
         ensureSpace(46);
         const uTop = doc.y;
@@ -746,7 +746,7 @@ export async function generateMaintenanceAuditPdf(
               { width: 92, align: 'right', lineBreak: false }
             );
             doc.font('Helvetica-Bold').fillColor(COLORS.ink);
-            doc.text(fmtMxn(rec.costMxn), marginL + 460, ry + 5, {
+            doc.text(fmtMxn(rec.cost), marginL + 460, ry + 5, {
               width: contentW - 466,
               align: 'right',
               lineBreak: false,

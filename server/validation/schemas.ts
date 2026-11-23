@@ -296,7 +296,7 @@ export const createAlertRule = z.object({
   ...targetTenant,
   name: requiredText(120),
   conditionType: z
-    .enum(['velocidad', 'geocerca', 'fatiga_dms', 'colision_g', 'desconexion_cam', 'panico'])
+    .enum(['velocidad', 'geocerca', 'fatiga_dms', 'colision_g', 'desconexion_cam', 'panico', 'licencia_vencimiento'])
     .optional(),
   thresholdLabel: requiredText(120),
   priority: priority.optional(),

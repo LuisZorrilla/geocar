@@ -4,7 +4,6 @@ import type {
   AssetType,
   DashcamVendorFamily,
   IncidentStatus,
-  LicenseCategory,
   LicenseValidityStatus,
   LinkStatus,
   MaintenanceStatus,
@@ -302,14 +301,7 @@ export const PERMISSION_LABELS: Record<PermissionLevel, { label: string; colorCl
   none: { label: 'Sin acceso', colorClass: 'text-slate-500' },
 };
 
-export const LICENSE_CATEGORIES: LicenseCategory[] = [
-  'Federal Tipo A',
-  'Federal Tipo B',
-  'Federal Tipo C',
-  'Federal Tipo E Carga',
-  'Maquinaria Especial',
-];
-
+/** Validity buckets of a driver license by days to expiry (see licenseValidity in DriverLicenseModal). */
 export const LICENSE_STATUS_META: Record<
   LicenseValidityStatus,
   { label: string; shortLabel: string; colorClass: string }
