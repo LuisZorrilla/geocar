@@ -147,13 +147,13 @@ export function AlertsIncidentsView({
         </div>
 
         {tab === 'alertas' && (
-          <div className="flex items-center gap-1.5">
-            {(['all', 'critica', 'alta', 'media'] as const).map((p) => (
+          <div className="flex flex-wrap items-center gap-1.5">
+            {(['all', 'critica', 'alta', 'media', 'informativa'] as const).map((p) => (
               <button
                 key={p}
                 type="button"
                 onClick={() => setPriorityFilter(p)}
-                className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer ${
+                className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
                   priorityFilter === p
                     ? 'bg-slate-800 text-slate-100 border border-slate-700'
                     : 'text-slate-400 hover:text-slate-200'
@@ -397,7 +397,7 @@ export function AlertsIncidentsView({
                 <Sliders className="w-4 h-4 text-sky-400" />
                 Configurar nueva regla en motor de eventos
               </div>
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+              <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
                 <input
                   type="text"
                   placeholder="Nombre de la regla (ej. Velocidad urbana > 60 km/h)"
@@ -405,6 +405,24 @@ export function AlertsIncidentsView({
                   onChange={(e) => setRuleForm((p) => ({ ...p, name: e.target.value }))}
                   className="md:col-span-2 px-3 py-2 bg-[#0B1120] border border-slate-800 rounded-lg text-slate-100"
                 />
+                <select
+                  value={ruleForm.conditionType}
+                  onChange={(e) =>
+                    setRuleForm((p) => ({
+                      ...p,
+                      conditionType: e.target.value as AlertRule['conditionType'],
+                    }))
+                  }
+                  className="px-3 py-2 bg-[#0B1120] border border-slate-800 rounded-lg text-slate-100"
+                >
+                  <option value="velocidad">Exceso de velocidad</option>
+                  <option value="colision_g">Frenado / G-Sensor</option>
+                  <option value="fatiga_dms">Fatiga DMS</option>
+                  <option value="geocerca">Geocerca operativa</option>
+                  <option value="desconexion_cam">Desconexión cámara</option>
+                  <option value="panico">Botón pánico</option>
+                  <option value="licencia_vencimiento">Vigencia de licencia</option>
+                </select>
                 <input
                   type="text"
                   placeholder="Umbral (ej. > 60 km/h / 10 s)"

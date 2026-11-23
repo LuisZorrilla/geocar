@@ -6,6 +6,7 @@ import {
   Layers,
   Lock,
   Plus,
+  QrCode,
   Save,
   ShieldCheck,
   Sliders,
@@ -21,6 +22,7 @@ import type {
 } from '../shared/types.ts';
 import { formatRelativeTime, LINK_META, VENDOR_FAMILY_LABELS } from '../lib/api.ts';
 import { Pagination, usePagination } from './Pagination.tsx';
+import { VigiantQrModal } from './VigiantQrModal.tsx';
 
 export interface DashcamConfigPayload {
   driverId: string;
@@ -139,6 +141,10 @@ export function DashcamConfigPanel({
   const [dirtyRows, setDirtyRows] = useState<Record<string, boolean>>({});
   const [savingRowId, setSavingRowId] = useState<string | null>(null);
   const [savingBatch, setSavingBatch] = useState(false);
+  const [vigiantQrModal, setVigiantQrModal] = useState<{ open: boolean; device: Device | null }>({
+    open: false,
+    device: null,
+  });
 
   // New custom driver form
   const [showNewDriver, setShowNewDriver] = useState(false);
@@ -475,6 +481,14 @@ export function DashcamConfigPanel({
             }`}
           >
             Catálogo de drivers ({dashcamDrivers.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setVigiantQrModal({ open: true, device: selectedDevice })}
+            className="inline-flex items-center gap-1.5 px-3 py-1 rounded text-xs font-medium bg-emerald-600/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-600/30 cursor-pointer whitespace-nowrap shrink-0"
+          >
+            <QrCode className="w-3.5 h-3.5" />
+            App Vigiant (QR)
           </button>
         </div>
       </div>
@@ -1006,6 +1020,14 @@ export function DashcamConfigPanel({
                                 className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-[11px] cursor-pointer whitespace-nowrap"
                               >
                                 Inspector
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setVigiantQrModal({ open: true, device: dev })}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#0B1120] hover:bg-slate-800 text-emerald-300 border border-emerald-500/30 text-[11px] cursor-pointer whitespace-nowrap"
+                              >
+                                <QrCode className="w-3 h-3" />
+                                QR Vigiant
                               </button>
                             </div>
                           </td>
@@ -1650,6 +1672,12 @@ export function DashcamConfigPanel({
           </div>
         </div>
       )}
+
+      <VigiantQrModal
+        open={vigiantQrModal.open}
+        device={vigiantQrModal.device}
+        onClose={() => setVigiantQrModal({ open: false, device: null })}
+      />
     </div>
   );
 }

@@ -3,12 +3,111 @@ import react from '@vitejs/plugin-react';
 import fs from 'fs';
 import path from 'path';
 import {defineConfig} from 'vite';
+import {VitePWA} from 'vite-plugin-pwa';
 
 export default defineConfig(() => {
   return {
     plugins: [
       react(),
       tailwindcss(),
+      VitePWA({
+        registerType: 'autoUpdate',
+        includeAssets: [
+          'icon.svg',
+          'apple-touch-icon.png',
+          'pwa-192x192.png',
+          'pwa-512x512.png',
+          'pwa-maskable-512x512.png',
+        ],
+        manifest: {
+          id: '/vigiant',
+          name: 'Vigiant · Rastreador Móvil GPS',
+          short_name: 'Vigiant',
+          description:
+            'Aplicación móvil GPS compatible con protocolo OsmAnd/Traccar para rastreo en tiempo real, botón SOS y búfer sin conexión.',
+          theme_color: '#1565C0',
+          background_color: '#F4F6F9',
+          display: 'standalone',
+          start_url: '/vigiant',
+          scope: '/',
+          shortcuts: [
+            {
+              name: 'Enviar SOS',
+              short_name: 'SOS',
+              description: 'Disparar alerta SOS inmediata al servidor',
+              url: '/vigiant?action=sos',
+            },
+            {
+              name: 'Estado y Logs',
+              short_name: 'Estado',
+              description: 'Ver registros de transmisión GPS y búfer offline',
+              url: '/vigiant?tab=estado',
+            },
+          ],
+          icons: [
+            {
+              src: '/pwa-192x192.png',
+              sizes: '192x192',
+              type: 'image/png',
+              purpose: 'any',
+            },
+            {
+              src: '/pwa-512x512.png',
+              sizes: '512x512',
+              type: 'image/png',
+              purpose: 'any',
+            },
+            {
+              src: '/pwa-maskable-512x512.png',
+              sizes: '512x512',
+              type: 'image/png',
+              purpose: 'maskable',
+            },
+          ],
+        },
+        workbox: {
+          maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
+          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
+          navigateFallback: '/index.html',
+          navigateFallbackDenylist: [/^\/api\//, /^\/osmand/],
+          runtimeCaching: [
+            {
+              urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
+              handler: 'CacheFirst',
+              options: {
+                cacheName: 'google-fonts-cache',
+                expiration: {
+                  maxEntries: 10,
+                  maxAgeSeconds: 60 * 60 * 24 * 365,
+                },
+                cacheableResponse: {
+                  statuses: [0, 200],
+                },
+              },
+            },
+            {
+              urlPattern: /^https:\/\/fonts\.gstatic\.com\/.*/i,
+              handler: 'CacheFirst',
+              options: {
+                cacheName: 'gstatic-fonts-cache',
+                expiration: {
+                  maxEntries: 10,
+                  maxAgeSeconds: 60 * 60 * 24 * 365,
+                },
+                cacheableResponse: {
+                  statuses: [0, 200],
+                },
+              },
+            },
+          ],
+        },
+        devOptions: {
+          enabled: true,
+          type: 'module',
+          navigateFallback: '/index.html',
+          navigateFallbackAllowlist: [/^\/$/, /^\/vigiant/],
+        },
+      }),
       // Copies src/assets into dist/ so root-relative URLs like
       // "/src/assets/images/..." (e.g. generate_image output) still resolve
       // in production builds. Do not remove.
@@ -24,6 +123,12 @@ export default defineConfig(() => {
           const distAssets = path.resolve(distDir, 'src/assets');
           if (fs.existsSync(distDir) && fs.existsSync(srcAssets)) {
             fs.cpSync(srcAssets, distAssets, {recursive: true, force: true});
+          }
+          const rootIndex = path.join(distDir, 'index.html');
+          if (fs.existsSync(rootIndex)) {
+            const vigiantDir = path.join(distDir, 'vigiant');
+            fs.mkdirSync(vigiantDir, {recursive: true});
+            fs.copyFileSync(rootIndex, path.join(vigiantDir, 'index.html'));
           }
         },
       },

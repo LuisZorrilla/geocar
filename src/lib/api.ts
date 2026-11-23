@@ -4,6 +4,8 @@ import type {
   AssetType,
   DashcamVendorFamily,
   IncidentStatus,
+  LicenseCategory,
+  LicenseValidityStatus,
   LinkStatus,
   MaintenanceStatus,
   OperationalStatus,
@@ -298,4 +300,23 @@ export const PERMISSION_LABELS: Record<PermissionLevel, { label: string; colorCl
   write: { label: 'Operación', colorClass: 'text-sky-400' },
   read: { label: 'Solo lectura', colorClass: 'text-slate-300' },
   none: { label: 'Sin acceso', colorClass: 'text-slate-500' },
+};
+
+export const LICENSE_CATEGORIES: LicenseCategory[] = [
+  'Federal Tipo A',
+  'Federal Tipo B',
+  'Federal Tipo C',
+  'Federal Tipo E Carga',
+  'Maquinaria Especial',
+];
+
+export const LICENSE_STATUS_META: Record<
+  LicenseValidityStatus,
+  { label: string; shortLabel: string; colorClass: string }
+> = {
+  vigente: { label: 'Vigente (> 30 d)', shortLabel: 'Vigente', colorClass: 'text-emerald-400' },
+  por_vencer_30: { label: 'Por vencer (≤ 30 d)', shortLabel: '≤ 30 días', colorClass: 'text-sky-400' },
+  por_vencer_15: { label: 'Por vencer (≤ 15 d)', shortLabel: '≤ 15 días', colorClass: 'text-amber-400' },
+  por_vencer_5: { label: 'Inminente (≤ 5 d)', shortLabel: '≤ 5 días', colorClass: 'text-amber-300' },
+  vencida: { label: 'Licencia vencida', shortLabel: 'Vencida', colorClass: 'text-rose-400' },
 };
