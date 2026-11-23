@@ -119,7 +119,7 @@ describe('alta y gestión de empresas (superadmin)', () => {
     assert.equal((await env.req('GET', '/api/tenants', { token: superadmin })).json.tenants.length, 4);
   });
 
-  test('el admin nuevo debe cambiar la contraseña; después tiene los 10 módulos y una empresa vacía', async () => {
+  test('el admin nuevo debe cambiar la contraseña; después tiene los 11 módulos y una empresa vacía', async () => {
     const login = await env.login('admin.andinos', created.temporaryPassword);
     assert.equal(login.status, 200);
     assert.equal(login.json.user.mustChangePassword, true);
@@ -145,7 +145,7 @@ describe('alta y gestión de empresas (superadmin)', () => {
     assert.equal(boot.status, 200);
     assert.ok(!boot.json.currentUser.mustChangePassword);
     assert.ok(Object.values(boot.json.currentRole.permissions).every((p) => p === 'full'));
-    assert.equal(Object.keys(boot.json.currentRole.permissions).length, 10);
+    assert.equal(Object.keys(boot.json.currentRole.permissions).length, 11);
     assert.equal(boot.json.vehicles.length, 0);
     assert.equal(boot.json.roles.length, 3);
     assert.equal(boot.json.preventivePlans.length, 3);

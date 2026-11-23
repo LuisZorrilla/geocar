@@ -39,6 +39,7 @@ interface ReportsSecurityViewProps {
 const MODULE_ROWS: Array<{ key: keyof ModulePermissions; label: string }> = [
   { key: 'administracion', label: 'Administración (Usuarios y perfiles)' },
   { key: 'flotas', label: 'Flotas, maquinaria y mantenimiento' },
+  { key: 'operaciones', label: 'Operaciones (clientes, pedidos y viajes)' },
   { key: 'dispositivos', label: 'Dispositivos (GPS, IMEI, JT808/JT1078)' },
   { key: 'dashcams_config', label: 'Configuración de Dashcams y Drivers' },
   { key: 'monitoreo', label: 'Monitoreo en mapa Esri' },
@@ -60,6 +61,7 @@ const DEFAULT_PERMISSIONS: ModulePermissions = {
   video: 'read',
   reportes: 'read',
   dimensionamiento: 'none',
+  operaciones: 'read',
 };
 
 export function ReportsSecurityView({

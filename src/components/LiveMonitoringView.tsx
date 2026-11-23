@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
@@ -21,6 +21,7 @@ import type {
   Vehicle,
 } from '../shared/types.ts';
 import {
+  apiRequest,
   ASSET_TYPE_LABELS,
   formatRelativeTime,
   LINK_META,
@@ -95,6 +96,23 @@ export function LiveMonitoringView({
     () => vehicles.find((v) => v.id === selectedVehicleId) ?? filteredVehicles[0] ?? null,
     [vehicles, selectedVehicleId, filteredVehicles]
   );
+
+  // TMS: active trip per unit (silently empty for profiles without access to Operaciones).
+  const [activeTrips, setActiveTrips] = useState<Record<string, { tripId: string; status: string; nextStop?: string }>>({});
+  useEffect(() => {
+    let cancelled = false;
+    const load = () =>
+      apiRequest<{ byVehicle: Record<string, { tripId: string; status: string; nextStop?: string }> }>('/api/tms/active')
+        .then((r) => !cancelled && setActiveTrips(r.byVehicle))
+        .catch(() => undefined);
+    void load();
+    const t = setInterval(load, 60_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, []);
+  const selectedTrip = selectedVehicle ? activeTrips[selectedVehicle.id] : undefined;
 
   const selectedDevice = useMemo(
     () => (selectedVehicle ? devices.find((d) => d.id === selectedVehicle.deviceId) ?? null : null),
@@ -235,6 +253,12 @@ export function LiveMonitoringView({
                     <div className="text-xs text-slate-400 mt-0.5 truncate">
                       {selectedVehicle.brandModel} · {selectedVehicle.driverName}
                     </div>
+                    {selectedTrip && (
+                      <div className="text-xs text-amber-300 mt-0.5 truncate">
+                        {selectedTrip.status === 'en_curso' ? 'En viaje' : 'Viaje planificado'} <span className="font-mono">{selectedTrip.tripId}</span>
+                        {selectedTrip.nextStop ? ` · próxima: ${selectedTrip.nextStop}` : ''}
+                      </div>
+                    )}
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
                     {selectedVehicle.operationalStatus === 'alerta' ? (

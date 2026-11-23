@@ -36,6 +36,7 @@ import { ExportMenu } from './ExportMenu.tsx';
 import { useMoney } from '../lib/money.tsx';
 import { CHECKLIST_DECISION_LABELS, checklistHasFailures } from '../shared/checklist.ts';
 import { decisionClass } from './ChecklistDetailDialog.tsx';
+import { UnitTmsPanel } from './tms/UnitTmsPanel.tsx';
 
 interface UnitDossierModalProps {
   vehicleId: string | null;
@@ -50,6 +51,8 @@ interface UnitDossierModalProps {
     vehicle: Vehicle;
     maintenanceRecords: MaintenanceRecord[];
   }) => void;
+  /** The unit changed outside maintenance (e.g. its load capacity). */
+  onVehicleUpdated?: (vehicle: Vehicle) => void;
 }
 
 interface DossierResponse {
@@ -68,6 +71,7 @@ export function UnitDossierModal({
   activeRole,
   onClose,
   onMaintenanceAdded,
+  onVehicleUpdated,
 }: UnitDossierModalProps) {
   const money = useMoney();
   const [dossier, setDossier] = useState<DossierResponse | null>(null);
@@ -368,6 +372,16 @@ export function UnitDossierModal({
                     )}
                   </div>
                 </div>
+
+                {/* TMS: active trip and load capacity */}
+                <UnitTmsPanel
+                  vehicle={activeVehicle}
+                  canEdit={canWriteMaint}
+                  onVehicleUpdated={(v) => {
+                    setDossier((d) => (d ? { ...d, vehicle: v } : d));
+                    onVehicleUpdated?.(v);
+                  }}
+                />
 
                 {/* Latest pre-op checklist of the unit */}
                 <div className="p-3 rounded-xl bg-[#0B1120] border border-slate-800/80 flex flex-wrap items-center justify-between gap-2">

@@ -198,9 +198,18 @@ const TABLES: TableDef[] = [
   documentTable('videoClips', 'video_clips'),
   documentTable('auditLogs', 'audit_logs'),
   documentTable('currencyChanges', 'currency_changes'),
+  documentTable('customers', 'customers'),
+  documentTable('places', 'places'),
+  documentTable('transportOrders', 'transport_orders'),
+  documentTable('trips', 'trips'),
+  documentTable('tariffs', 'tariffs'),
+  documentTable('fuelLoads', 'fuel_loads'),
+  documentTable('tripExpenses', 'trip_expenses'),
+  documentTable('preInvoices', 'pre_invoices'),
+  documentTable('driverSettlements', 'driver_settlements'),
 ];
 
-export const ALL_TABLES = [...TABLES.map((t) => t.table), 'app_settings', 'sessions', 'driver_files', 'obd_samples', 'obd_fault_events'];
+export const ALL_TABLES = [...TABLES.map((t) => t.table), 'app_settings', 'sessions', 'driver_files', 'tms_files', 'obd_samples', 'obd_fault_events'];
 
 export interface StoredSession {
   tokenHash: string;
@@ -437,6 +446,20 @@ export class StateRepository {
     ]);
   }
 
+  // ---- TMS proof-of-delivery files (signatures and photos) ------------------
+
+  async saveTmsFile(f: { id: string; tenantId: string; tripId: string; kind: 'signature' | 'photo' | 'receipt'; mime: string; size: number; sha256: string; data: Buffer; createdBy: string }): Promise<void> {
+    await getPool().query(
+      `INSERT INTO tms_files (id, tenant_id, trip_id, kind, mime, size, sha256, data, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [f.id, f.tenantId, f.tripId, f.kind, f.mime, f.size, f.sha256, f.data, f.createdBy]
+    );
+  }
+
+  async getTmsFile(tenantId: string, id: string): Promise<{ tripId: string; kind: string; mime: string; data: Buffer } | null> {
+    const { rows } = await getPool().query('SELECT trip_id, kind, mime, data FROM tms_files WHERE tenant_id = $1 AND id = $2', [tenantId, id]);
+    return rows[0] ? { tripId: rows[0].trip_id, kind: rows[0].kind, mime: rows[0].mime, data: rows[0].data } : null;
+  }
+
   // ---- Global settings (single keys in app_settings) -------------------------
 
   async getAppSetting<T>(key: string): Promise<T | null> {
@@ -475,6 +498,23 @@ export class StateRepository {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
       [x.tenantId, x.vehicleId, x.at, x.rpm ?? null, x.coolantC ?? null, x.fuelPct ?? null, x.batteryV ?? null, x.odometerKm ?? null, x.speedKmh ?? null]
     );
+  }
+
+  /**
+   * OBD fuel level around a fuel load: lowest level in the 90 min before and highest in the 90 min
+   * after. Null when the unit has no OBD readings in either window.
+   */
+  async obdFuelAround(tenantId: string, vehicleId: string, atIso: string): Promise<{ before: number; after: number } | null> {
+    const { rows } = await getPool().query(
+      `SELECT
+         (SELECT min(fuel_pct) FROM obd_samples WHERE tenant_id = $1 AND vehicle_id = $2 AND fuel_pct IS NOT NULL
+             AND at BETWEEN $3::timestamptz - interval '90 minutes' AND $3::timestamptz) AS before,
+         (SELECT max(fuel_pct) FROM obd_samples WHERE tenant_id = $1 AND vehicle_id = $2 AND fuel_pct IS NOT NULL
+             AND at BETWEEN $3::timestamptz AND $3::timestamptz + interval '90 minutes') AS after`,
+      [tenantId, vehicleId, atIso]
+    );
+    const r = rows[0];
+    return r && r.before != null && r.after != null ? { before: Number(r.before), after: Number(r.after) } : null;
   }
 
   /** Averages per bucket (plus max temperature / min battery) between from and now. */

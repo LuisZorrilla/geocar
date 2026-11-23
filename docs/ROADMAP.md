@@ -195,3 +195,20 @@ Detalle en [docs/MONEDAS.md](MONEDAS.md).
 - [x] Equivalente en la moneda de referencia, carga de importes en otra moneda (repuestos, mano de obra, almacén), consolidado de todas las empresas y exportaciones con la moneda.
 - [ ] Definir la moneda de las empresas existentes desde Empresas: quedan «Sin moneda» hasta que el superadmin la elige.
 - [ ] Carga automática programada de cotizaciones (hoy es manual, con la sugerencia como ayuda).
+
+## Operaciones / TMS (fase T1)
+
+Detalle en [docs/TMS.md](TMS.md).
+
+- [x] Clientes (CUIT validado), lugares con geocerca circular dibujada en el mapa y capacidad de carga por unidad (desde su ficha).
+- [x] Pedidos de transporte con ventanas de carga y entrega (borrador → confirmado → planificado → en curso → entregado).
+- [x] Viajes con paradas armadas solas a partir de los pedidos y validación de la asignación: bloqueos (chofer no habilitado, OT crítica, checklist «No apto», superposición, carga peligrosa sin E.3) y advertencias aceptables con motivo (capacidad, frío, preventivo vencido).
+- [x] Seguimiento automático por geocerca cada minuto, sin importar de dónde llega la posición (cámara, OBD o celular), alerta «Entrega demorada», y paradas marcadas a mano con motivo.
+- [x] Permiso nuevo `operaciones` (los roles existentes reciben el nivel que tenían en `flotas`), auditoría y exportaciones PDF, Excel y CSV.
+- [x] T2: app del chofer (`/chofer`, link personal con QR) con el viaje, llegadas, carga, **entrega con firma, nombre y DNI** (fotos opcionales) y novedades que se registran como incidentes; link público de seguimiento para el cliente (`/seguimiento/<token>`) con hora estimada de llegada; remito con conformidad y hoja de ruta en PDF.
+- [ ] T2, pendiente de campo: probar la app en celulares reales (Android e iPhone), la firma con el dedo y la ubicación al entregar; decidir si la app del chofer también envía la posición, en vez de Traccar Client.
+- [x] T3: tarifario por cliente (tramo, km, tonelada, pallet y adicionales: estadía, peligrosa, frío, peajes) con cotizador y precio automático al entregar; combustible (manual, app del chofer e importación CSV/Excel) con alertas de consumo (tanque, rendimiento, odómetro, nivel OBD); gastos del viaje con aprobación; costo y rentabilidad por viaje, cliente, unidad y chofer; pre-facturas y liquidaciones de viáticos en PDF, Excel y CSV.
+- [ ] T3, pendiente de datos reales: probar la importación con un resumen real de la tarjeta de flota; cargar el tanque y la capacidad de las unidades y el costo mensual de los choferes.
+- [x] T4: ruteo híbrido (OSRM + VROOM si están configurados, motor propio si no), «Optimizar orden» de un viaje, planificador del día (qué unidad lleva qué pedidos y en qué orden), tablero de despacho con línea de tiempo, hora estimada en vivo por parada y alerta anticipada «Demora prevista».
+- [ ] T4, en el VPS: instalar OSRM y VROOM ([docs/RUTEO.md](RUTEO.md)) y cargar `OSRM_URL` y `VROOM_URL`; cargar el tiempo de carga y descarga de cada lugar.
+- [ ] T5: COT y Carta de Porte electrónica, factura de ARCA, portal del cliente, API y webhooks, tercerizados.

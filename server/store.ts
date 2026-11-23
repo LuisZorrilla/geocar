@@ -14,6 +14,11 @@ import { DriverRegistry } from './drivers/registry.ts';
 import { CurrencyService } from './currency/service.ts';
 import { BASE_CURRENCIES, formatMoney } from '../src/shared/currency.ts';
 import { CHECKLIST_DECISION_LABELS } from '../src/shared/checklist.ts';
+import { TmsService } from './tms/service.ts';
+import { buildTmsDemo } from './tms/demo.ts';
+import { CostsService } from './tms/costs.ts';
+import { RoutingService } from './routing/service.ts';
+import { RoutingEngine, routingConfigFromEnv } from './routing/provider.ts';
 import {
   newPhoneIdentifier,
   PHONE_DEVICE_PRIORITY_MS,
@@ -163,6 +168,7 @@ export const SUPERADMIN_ROLE: RoleDefinition = {
     video: 'full',
     reportes: 'full',
     dimensionamiento: 'full',
+    operaciones: 'full',
   },
 };
 
@@ -478,6 +484,7 @@ function buildTenantBaseRoles(tenantId: string): RoleDefinition[] {
         video: 'full',
         reportes: 'full',
         dimensionamiento: 'full',
+        operaciones: 'full',
       },
     },
     {
@@ -496,6 +503,7 @@ function buildTenantBaseRoles(tenantId: string): RoleDefinition[] {
         video: 'write',
         reportes: 'read',
         dimensionamiento: 'none',
+        operaciones: 'read',
       },
     },
     {
@@ -514,6 +522,7 @@ function buildTenantBaseRoles(tenantId: string): RoleDefinition[] {
         video: 'read',
         reportes: 'full',
         dimensionamiento: 'read',
+        operaciones: 'full',
       },
     },
   ];
@@ -1626,6 +1635,8 @@ function buildInitialState(demoCredentials: DemoCredential[] = []): FleetStoreSt
       { id: 'fx-demo-clp', currency: 'CLP', perUsd: 950, effectiveAt: '2026-01-01T00:00:00.000Z', source: 'demo', createdBy: 'Datos demo', createdAt: '2026-01-01T00:00:00.000Z', tenantId: null },
     ],
     currencyChanges: [],
+    // TMS demo: customers, places and orders (only seeded data; production starts empty).
+    ...buildTmsDemo(tenants, vehicles, (tid) => vehicles.find((v) => v.tenantId === tid)?.unitCode.split('-')[0] ?? 'EMP', drivers),
     sizing: {
       vehiclesCount: 96,
       gpsIntervalSec: 15,
@@ -1759,6 +1770,38 @@ class FleetStore {
     },
     persist: () => this.persist(this.state),
   }));
+  /** TMS: customers, places, transport orders and trips (automatic stop tracking). */
+  readonly tms = new TmsService(() => ({
+    state: this.state,
+    repo: this.repo,
+    onOrderDelivered: (order) => this.costs.onOrderDelivered(order),
+    audit: (entry) => {
+      this.addAuditLog(entry);
+    },
+    persist: () => this.persist(this.state),
+  }));
+  /** TMS T4: routing (OSRM/VROOM when configured, built-in otherwise), planner, dispatch, live ETAs. */
+  readonly routing = new RoutingService(
+    () => ({
+      state: this.state,
+      tms: this.tms,
+      audit: (entry) => {
+        this.addAuditLog(entry);
+      },
+      persist: () => this.persist(this.state),
+    }),
+    new RoutingEngine(routingConfigFromEnv())
+  );
+  /** TMS T3: tariffs, fuel, expenses, trip cost, pre-invoices and settlements. */
+  readonly costs = new CostsService(() => ({
+    state: this.state,
+    repo: this.repo,
+    audit: (entry) => {
+      this.addAuditLog(entry);
+    },
+    persist: () => this.persist(this.state),
+    currencyOf: (tenantId) => this.currency.tenantCurrency(tenantId),
+  }));
   /** Currencies, exchange rates and company currency (superadmin). */
   readonly currency = new CurrencyService(() => ({
     state: this.state,
@@ -1785,7 +1828,8 @@ class FleetStore {
     const legacyDriversChanged = this.driverRegistry.normalizeLegacy();
     const verificationChanged = this.driverRegistry.normalizeVerification();
     const currencyChanged = this.currency.normalize();
-    if (devicesChanged || driversChanged || legacyDriversChanged || verificationChanged || currencyChanged) {
+    const tmsChanged = this.normalizeTmsPermissions();
+    if (devicesChanged || driversChanged || legacyDriversChanged || verificationChanged || currencyChanged || tmsChanged) {
       this.persist(this.state);
       await this.flush();
     }
@@ -1797,6 +1841,28 @@ class FleetStore {
     this.cameraServerOverride = await this.repo.getAppSetting<CameraServerOverride>('camera_server');
     await this.currency.load();
     this.initialized = true;
+  }
+
+  /**
+   * The "operaciones" (TMS) permission was added later: roles created before it get the same
+   * level they have in "flotas", so nobody gains or loses access. Also makes sure the TMS
+   * collections exist.
+   */
+  private normalizeTmsPermissions(): boolean {
+    let changed = false;
+    for (const role of this.state.roles) {
+      if (!role.permissions.operaciones) {
+        role.permissions.operaciones = role.permissions.flotas ?? 'none';
+        changed = true;
+      }
+    }
+    for (const key of ['customers', 'places', 'transportOrders', 'trips', 'tariffs', 'fuelLoads', 'tripExpenses', 'preInvoices', 'driverSettlements'] as const) {
+      if (!Array.isArray(this.state[key])) {
+        (this.state as unknown as Record<string, unknown[]>)[key] = [];
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   private buildFreshState(): FleetStoreState {
@@ -1854,6 +1920,15 @@ class FleetStore {
       auditLogs: [],
       exchangeRates: [],
       currencyChanges: [],
+      customers: [],
+      places: [],
+      transportOrders: [],
+      trips: [],
+      tariffs: [],
+      fuelLoads: [],
+      tripExpenses: [],
+      preInvoices: [],
+      driverSettlements: [],
     };
   }
 
@@ -3451,7 +3526,7 @@ class FleetStore {
         currentRole: SUPERADMIN_ROLE,
         users: scopedUsers,
         roles: scopedRoles,
-        drivers: byScope(this.state.drivers),
+        drivers: byScope(this.state.drivers).map((d) => DriverRegistry.withoutSecrets(d)),
         vehicles: scopedVehicles,
         devices: byScope(this.state.devices),
         maintenanceRecords: byScope(this.state.maintenanceRecords),
@@ -3497,7 +3572,7 @@ class FleetStore {
       roles: tenantRoles,
       drivers: this.state.drivers
         .filter((d) => d.tenantId === tenantId)
-        .map((d) => (currentRole?.isSystemAdminRole ? d : DriverRegistry.redact(d))),
+        .map((d) => (currentRole?.isSystemAdminRole ? DriverRegistry.withoutSecrets(d) : DriverRegistry.redact(d))),
       vehicles: tenantVehicles,
       devices: this.state.devices.filter((d) => d.tenantId === tenantId),
       maintenanceRecords: this.state.maintenanceRecords.filter((m) => m.tenantId === tenantId),
@@ -3729,7 +3804,7 @@ class FleetStore {
 
   createRole(
     tenantId: string,
-    input: { name: string; description: string; permissions: ModulePermissions },
+    input: { name: string; description: string; permissions: Omit<ModulePermissions, 'operaciones'> & { operaciones?: ModulePermissions['operaciones'] } },
     actorName: string,
     actorRole: string,
     actorHidden = false
@@ -3738,6 +3813,7 @@ class FleetStore {
     const normalizedPermissions: ModulePermissions = {
       ...input.permissions,
       dashcams_config: input.permissions.dashcams_config ?? 'none',
+      operaciones: input.permissions.operaciones ?? input.permissions.flotas,
     };
     const role: RoleDefinition = {
       id: `rol-${resolvedTenantId}-${uid()}`,

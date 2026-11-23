@@ -128,7 +128,7 @@ export class DriverRegistry {
   toListItem(d: Driver, today = new Date()): DriverListItem {
     const v = this.vehicleOf(d);
     return {
-      ...d,
+      ...DriverRegistry.withoutSecrets(d),
       history: d.history?.slice(0, HISTORY_LIMIT),
       authorization: computeDriverAuthorization(d, today),
       assignedVehicle: v ? { id: v.id, unitCode: v.unitCode, plate: v.plate } : undefined,
@@ -210,6 +210,13 @@ export class DriverRegistry {
   }
 
   /** Bootstrap copy for users who are not driver administrators: no personal data or documents. */
+  /** The driver as sent to the browser: never the hash of the app link token. */
+  static withoutSecrets<T extends Driver>(d: T): T {
+    if (!d.appAccess) return d;
+    const { tokenHash: _secret, ...access } = d.appAccess;
+    return { ...d, appAccess: { ...access, tokenHash: '' } };
+  }
+
   static redact(d: Driver): Driver {
     return {
       id: d.id,

@@ -14,6 +14,11 @@ import { alertsReport, fleetReport, vehicleReport, workOrdersReport, type Export
 import { exportFileBase, respondWithReport, type ExportActor } from './server/export/send.ts';
 import { DriverError, registerDriverRoutes } from './server/drivers/routes.ts';
 import { CurrencyError } from './server/currency/service.ts';
+import { registerTmsRoutes } from './server/tms/routes.ts';
+import { registerDriverAppRoutes } from './server/tms/driverAppRoutes.ts';
+import { registerCostsRoutes } from './server/tms/costsRoutes.ts';
+import { registerRoutingRoutes } from './server/routing/routes.ts';
+import { TmsError } from './server/tms/service.ts';
 import { registerCurrencyRoutes } from './server/currency/routes.ts';
 import * as traccar from './server/traccar/client.ts';
 import { findObdCommand } from './src/shared/teltonika.ts';
@@ -142,6 +147,16 @@ async function startServer() {
   setInterval(purgeObd, 24 * 60 * 60 * 1000).unref();
   // Driver phones: «sin señal» alerts when a unit depends on a silent phone.
   setInterval(() => fleetStore.sweepPhones(), 60 * 1000).unref();
+  // TMS: stops advance with the units' positions; late deliveries raise one alert.
+  setInterval(() => {
+    try {
+      fleetStore.tms.evaluateTrips();
+    } catch (err) {
+      console.error('[tms] Error al evaluar viajes:', err);
+    }
+    // Live ETAs (and the "expected delay" alert); async because it may call OSRM.
+    fleetStore.routing.refreshEtas().catch((err) => console.error('[ruteo] Error al calcular ETAs:', err));
+  }, 60 * 1000).unref();
 
   const app = express();
   const isProd = process.env.NODE_ENV === 'production';
@@ -446,6 +461,10 @@ async function startServer() {
 
   registerDriverRoutes(app, { requireAuth, getRequestedScope, targetTenantOrFail });
   registerCurrencyRoutes(app, { requireAuth });
+  registerTmsRoutes(app, { requireAuth, getRequestedScope, targetTenantOrFail });
+  registerDriverAppRoutes(app);
+  registerCostsRoutes(app, { requireAuth, getRequestedScope, targetTenantOrFail });
+  registerRoutingRoutes(app, { requireAuth, getRequestedScope, targetTenantOrFail });
 
   app.get('/api/vehicles/:id/dossier', (req, res) => {
     const ctx = requireAuth(req, res);
@@ -1780,6 +1799,10 @@ async function startServer() {
 
   app.use('/api', (err: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
     if (res.headersSent) return next(err);
+    if (err instanceof TmsError) {
+      res.status(err.status).json({ error: err.message, ...(err.details && typeof err.details === 'object' ? err.details : {}) });
+      return;
+    }
     if (err instanceof DomainError || err instanceof DriverError || err instanceof CurrencyError) {
       res.status(err.status).json({ error: err.message });
       return;

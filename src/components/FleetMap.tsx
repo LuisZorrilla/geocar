@@ -21,7 +21,7 @@ interface FleetMapProps {
   onSelectVehicle: (vehicleId: string) => void;
 }
 
-function detectWebGLSupport(): boolean {
+export function detectWebGLSupport(): boolean {
   try {
     const canvas = document.createElement('canvas');
     return Boolean(
@@ -33,7 +33,7 @@ function detectWebGLSupport(): boolean {
   }
 }
 
-function createArcGISBasemap(mode: 'dark-gray-canvas' | 'imagery'): Basemap {
+export function createArcGISBasemap(mode: 'dark-gray-canvas' | 'imagery'): Basemap {
   if (mode === 'imagery') {
     return new Basemap({
       id: 'esri-imagery-keyless',
@@ -247,7 +247,9 @@ export function FleetMap({ vehicles, selectedVehicleId, onSelectVehicle }: Fleet
               yoffset: 16,
               font: {
                 size: 10,
-                family: 'JetBrains Mono, monospace',
+                // The map draws text with glyphs from static.arcgis.com/fonts: the family must exist
+                // there (JetBrains Mono doesn't → 404 and fallback). Ubuntu Mono is the monospace one.
+                family: 'Ubuntu Mono',
                 weight: 'bold',
               },
             }),

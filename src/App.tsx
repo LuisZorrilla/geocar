@@ -12,6 +12,7 @@ import {
   Menu,
   PanelLeftClose,
   PanelLeftOpen,
+  Route,
   Server,
   Truck,
   X,
@@ -67,6 +68,7 @@ import { MoneyProvider } from './lib/money.tsx';
 import { CurrenciesView } from './components/CurrenciesView.tsx';
 import { ForcePasswordChange } from './components/ForcePasswordChange.tsx';
 import { UnitDossierModal } from './components/UnitDossierModal.tsx';
+import { OperationsView } from './components/tms/OperationsView.tsx';
 import type { ReviewChecklistHandler } from './shared/checklist.ts';
 
 type NavSection =
@@ -79,7 +81,8 @@ type NavSection =
   | 'dimensionamiento'
   | 'empresas'
   | 'monedas'
-  | 'choferes';
+  | 'choferes'
+  | 'operaciones';
 
 const NAV_ITEMS: Array<{
   id: NavSection;
@@ -93,6 +96,7 @@ const NAV_ITEMS: Array<{
 }> = [
   { id: 'monitoreo', label: 'Monitoreo en Vivo', icon: MapIcon, permKey: 'monitoreo' },
   { id: 'flotas', label: 'Flotas y Maquinaria', icon: Truck, permKey: 'flotas' },
+  { id: 'operaciones', label: 'Operaciones', icon: Route, permKey: 'operaciones' },
   { id: 'video', label: 'Consola de Video', icon: Film, permKey: 'video' },
   { id: 'alertas', label: 'Alertas e Incidentes', icon: AlertTriangle, permKey: 'alertas' },
   { id: 'empresas', label: 'Empresas', icon: Building2, permKey: 'administracion', superadminOnly: true },
@@ -1504,6 +1508,17 @@ export default function App() {
 
           {activeNav === 'monedas' && isSuperadmin && (
             <CurrenciesView showToast={showToast} onChanged={() => void refreshWorkspaceSilently()} />
+          )}
+
+          {activeNav === 'operaciones' && (
+            <OperationsView
+              tenant={data.tenant}
+              vehicles={data.vehicles}
+              drivers={data.drivers}
+              canWrite={isSuperadmin || data.currentRole.permissions.operaciones === 'full' || data.currentRole.permissions.operaciones === 'write'}
+              canApprove={isSuperadmin || Boolean(data.currentRole.isSystemAdminRole) || data.currentRole.permissions.operaciones === 'full'}
+              onDataChanged={() => void refreshWorkspaceSilently()}
+            />
           )}
 
           {activeNav === 'choferes' && isDriverAdmin && (

@@ -1,5 +1,7 @@
 import type { CurrencyChange, CurrencyCode, CurrencyDef, ExchangeRate, MoneySnapshot } from './currency.ts';
 import type { DriverAuthState, DriverAuthorization, DriverDocument, DriverProfile } from './drivers.ts';
+import type { Customer, DriverAppAccess, Place, TransportOrder, Trip } from './tms.ts';
+import type { DriverSettlement, FuelLoad, PreInvoice, Tariff, TripExpense } from './costs.ts';
 export type AssetType = 'vehiculo' | 'maquinaria_pesada';
 
 export type MaintenanceStatus = 'al_dia' | 'proximo' | 'vencido';
@@ -54,6 +56,8 @@ export interface ModulePermissions {
   video: PermissionLevel;
   reportes: PermissionLevel;
   dimensionamiento: PermissionLevel;
+  /** TMS: customers, places, transport orders and trips. */
+  operaciones: PermissionLevel;
 }
 
 export interface Tenant {
@@ -155,6 +159,10 @@ export interface Driver {
   history?: DriverHistoryEntry[];
   /** Driver's smartphone running Traccar Client (tracks the driver while assigned to a unit). */
   phoneTracker?: DriverPhoneTracker;
+  /** Personal link to the driver's trips app (TMS). */
+  appAccess?: DriverAppAccess;
+  /** Monthly cost of the driver (salary + charges), spread per trip hour in the trip cost. */
+  monthlyCost?: number;
   createdAt?: string;
   updatedAt?: string;
 }
@@ -465,7 +473,17 @@ export interface Vehicle {
   /** E.g. "Celular de Pérez, Juan" when the position comes from the driver's phone. */
   positionSourceLabel?: string;
   geofenceName: string;
+  /** Load capacity (TMS assignment checks). */
+  capacityKg?: number;
+  capacityM3?: number;
+  capacityPallets?: number;
+  bodyType?: VehicleBodyType;
+  refrigerated?: boolean;
+  /** Fuel tank (liters): checks loads that exceed it and the OBD level rise. */
+  tankLiters?: number;
 }
+
+export type VehicleBodyType = 'caja_seca' | 'refrigerado' | 'playo' | 'tanque' | 'volcador' | 'otro';
 
 export interface Device {
   id: string;
@@ -751,6 +769,15 @@ export interface FleetStoreState {
   currencies: CurrencyDef[];
   exchangeRates: ExchangeRate[];
   currencyChanges: CurrencyChange[];
+  customers: Customer[];
+  places: Place[];
+  transportOrders: TransportOrder[];
+  trips: Trip[];
+  tariffs: Tariff[];
+  fuelLoads: FuelLoad[];
+  tripExpenses: TripExpense[];
+  preInvoices: PreInvoice[];
+  driverSettlements: DriverSettlement[];
   sizing: SizingConfig;
 }
 

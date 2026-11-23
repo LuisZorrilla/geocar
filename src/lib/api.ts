@@ -90,9 +90,20 @@ export async function apiRequest<T>(url: string, options: RequestInit = {}): Pro
   const res = await fetch(url, { ...options, headers });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(typeof data.error === 'string' ? data.error : `Error HTTP ${res.status}`);
+    throw new ApiError(typeof data.error === 'string' ? data.error : `Error HTTP ${res.status}`, res.status, data);
   }
   return data as T;
+}
+
+/** API error with the HTTP status and the response body (e.g. the checks that blocked an action). */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly data: Record<string, unknown>
+  ) {
+    super(message);
+  }
 }
 
 /**

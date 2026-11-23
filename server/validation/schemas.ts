@@ -33,9 +33,13 @@ const MODULES = [
   'reportes',
   'dimensionamiento',
 ] as const;
-const modulePermissions = z.object(
-  Object.fromEntries(MODULES.map((m) => [m, permissionLevel])) as Record<(typeof MODULES)[number], typeof permissionLevel>
-).strict();
+const modulePermissions = z
+  .object({
+    ...(Object.fromEntries(MODULES.map((m) => [m, permissionLevel])) as Record<(typeof MODULES)[number], typeof permissionLevel>),
+    // TMS module, added later: when missing it takes the role's "flotas" level.
+    operaciones: permissionLevel.optional(),
+  })
+  .strict();
 const modulePermissionsPatch = modulePermissions.partial();
 
 const assetType = z.enum(['vehiculo', 'maquinaria_pesada']);
@@ -605,3 +609,222 @@ export const setTenantCurrency = z.object({
 });
 
 export const platformReferenceCurrency = z.object({ currency: currencyCode });
+
+// ---------- TMS (operaciones) ----------
+
+const isoDateTime = z
+  .string()
+  .trim()
+  .refine((v) => /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(v) && Number.isFinite(Date.parse(v)), 'fecha y hora inválidas');
+const timeWindow = z.object({ from: isoDateTime, to: isoDateTime });
+const qty = z.coerce.number().finite().nonnegative().max(1_000_000);
+
+const customerContact = z.object({
+  name: text(120),
+  phone: text(40).optional(),
+  email: z.union([z.literal(''), z.string().trim().email('email inválido').max(120)]).optional(),
+});
+const customerFields = {
+  name: requiredText(160),
+  taxId: requiredText(30),
+  taxCondition: text(60).optional(),
+  contacts: z.array(customerContact).max(10).optional(),
+  notes: text(1000).optional(),
+  active: z.boolean().optional(),
+};
+export const createCustomer = z.object({ ...targetTenant, ...customerFields });
+export const updateCustomer = z.object(customerFields).partial();
+
+const placeFields = {
+  customerId: id.nullable().optional(),
+  name: requiredText(160),
+  kind: z.enum(['deposito', 'planta', 'cliente', 'puerto', 'otro']),
+  address: text(240),
+  lat: z.coerce.number().finite().min(-90).max(90),
+  lng: z.coerce.number().finite().min(-180).max(180),
+  radiusM: z.coerce.number().int().min(50).max(2000).optional(),
+  serviceMinutes: z.coerce.number().int().min(0).max(1440).nullable().optional(),
+  openingHours: text(120).optional(),
+  notes: text(1000).optional(),
+  active: z.boolean().optional(),
+};
+export const createPlace = z.object({ ...targetTenant, ...placeFields });
+export const updatePlace = z.object(placeFields).partial();
+
+const cargo = z.object({
+  description: requiredText(200),
+  weightKg: qty.optional(),
+  volumeM3: qty.optional(),
+  pallets: z.coerce.number().int().nonnegative().max(10_000).optional(),
+  dangerous: z.boolean().optional(),
+  refrigerated: z.boolean().optional(),
+});
+const orderFields = {
+  customerId: id,
+  originPlaceId: id,
+  destinationPlaceId: id,
+  cargo,
+  pickupWindow: timeWindow.optional(),
+  deliveryWindow: timeWindow.optional(),
+  reference: text(60).optional(),
+  notes: text(1000).optional(),
+};
+export const createOrder = z.object({ ...targetTenant, ...orderFields, confirm: z.boolean().optional() });
+export const updateOrder = z.object(orderFields).partial();
+export const cancelWithReason = z.object({ reason: requiredText(300) });
+
+const acceptWarnings = z.object({ reason: text(300) }).optional();
+const tripAssignment = {
+  vehicleId: id,
+  driverId: id,
+  plannedStart: isoDateTime,
+  orderIds: z.array(id).min(1, 'elegí al menos un pedido').max(50),
+};
+export const validateTrip = z.object({ ...targetTenant, ...tripAssignment, tripId: id.optional() });
+export const createTrip = z.object({ ...targetTenant, ...tripAssignment, notes: text(1000).optional(), acceptWarnings });
+export const updateTrip = z.object({
+  vehicleId: id.optional(),
+  driverId: id.optional(),
+  plannedStart: isoDateTime.optional(),
+  notes: text(1000).optional(),
+  stopOrder: z.array(id).min(1).max(100).optional(),
+  acceptWarnings,
+});
+export const setStopStatus = z.object({ status: z.enum(['en_lugar', 'completada', 'omitida']), note: text(300).optional() });
+
+export const vehicleCapacity = z.object({
+  capacityKg: qty.nullable().optional(),
+  capacityM3: qty.nullable().optional(),
+  capacityPallets: z.coerce.number().int().nonnegative().max(1000).nullable().optional(),
+  tankLiters: z.coerce.number().positive().max(5000).nullable().optional(),
+  bodyType: z.enum(['caja_seca', 'refrigerado', 'playo', 'tanque', 'volcador', 'otro']).nullable().optional(),
+  refrigerated: z.boolean().optional(),
+});
+
+// ---------- TMS T2: app del chofer y prueba de entrega ----------
+
+const podFileId = z.string().trim().regex(/^pod-[a-z0-9]{10,40}$/, 'archivo inválido');
+export const deliverStop = z.object({
+  receiverName: requiredText(120),
+  receiverDni: z.string().trim().max(20),
+  signatureFileId: podFileId,
+  photoFileIds: z.array(podFileId).max(5).optional(),
+  note: text(500).optional(),
+  lat: z.number().finite().min(-90).max(90).optional(),
+  lng: z.number().finite().min(-180).max(180).optional(),
+  accuracyM: z.number().finite().nonnegative().max(100_000).optional(),
+});
+export const driverReport = z.object({
+  type: z.enum(['rechazo', 'faltante', 'averia', 'demora', 'acceso', 'otro']),
+  note: requiredText(500),
+  stopId: id.optional(),
+  photoFileId: podFileId.optional(),
+});
+export const failStop = z.object({
+  type: z.enum(['rechazo', 'faltante', 'acceso', 'otro']).optional(),
+  reason: requiredText(300),
+});
+
+// ---------- TMS T3: tarifas, combustible, gastos y facturación ----------
+
+const amount = z.coerce.number().finite().nonnegative().max(1_000_000_000_000);
+const dateOnly = z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/, 'fecha inválida (AAAA-MM-DD)');
+const tariffRule = z.object({
+  id: id.optional(),
+  kind: z.enum(['tramo', 'km', 'tonelada', 'pallet']),
+  originPlaceId: id.optional(),
+  destinationPlaceId: id.optional(),
+  bothWays: z.boolean().optional(),
+  price: amount,
+  minimum: amount.optional(),
+});
+export const saveTariff = z.object({
+  ...targetTenant,
+  customerId: id,
+  name: requiredText(120),
+  active: z.boolean().optional(),
+  priority: z.array(z.enum(['tramo', 'km', 'tonelada', 'pallet'])).max(4).optional(),
+  rules: z.array(tariffRule).min(1, 'agregá al menos una regla').max(200),
+  extras: z
+    .object({
+      waitingPerHour: amount.optional(),
+      waitingFreeMinutes: z.coerce.number().int().min(0).max(1440).optional(),
+      dangerousPct: z.coerce.number().min(0).max(300).optional(),
+      refrigeratedPct: z.coerce.number().min(0).max(300).optional(),
+      tollsPassThrough: z.boolean().optional(),
+    })
+    .optional(),
+  notes: text(1000).optional(),
+});
+export const quote = z.object({
+  ...targetTenant,
+  customerId: id,
+  originPlaceId: id,
+  destinationPlaceId: id,
+  weightKg: amount.optional(),
+  pallets: z.coerce.number().int().nonnegative().max(10_000).optional(),
+  dangerous: z.boolean().optional(),
+  refrigerated: z.boolean().optional(),
+});
+export const setCharge = z.object({ amount: amount.optional(), reason: text(300).optional(), recalculate: z.boolean().optional() });
+export const fuelLoad = z.object({
+  ...targetTenant,
+  vehicleId: id,
+  at: isoDateTime.optional(),
+  liters: z.coerce.number().positive().max(5000),
+  total: amount.optional(),
+  pricePerLiter: amount.optional(),
+  odometerKm: z.coerce.number().nonnegative().max(10_000_000).optional(),
+  station: text(160).optional(),
+  fullTank: z.boolean().optional(),
+});
+export const driverFuel = z.object({
+  liters: z.coerce.number().positive().max(5000),
+  total: amount,
+  odometerKm: z.coerce.number().nonnegative().max(10_000_000).optional(),
+  station: text(160).optional(),
+  receiptFileId: z.string().trim().regex(/^pod-[a-z0-9]{10,40}$/).optional(),
+});
+const expenseType = z.enum(['peaje', 'comida', 'alojamiento', 'estacionamiento', 'lavado', 'otro']);
+export const tripExpense = z.object({
+  tripId: id,
+  type: expenseType,
+  amount: amount.refine((n) => n > 0, 'debe ser mayor que 0'),
+  at: isoDateTime.optional(),
+  note: text(300).optional(),
+  paidBy: z.enum(['chofer', 'empresa']).optional(),
+});
+export const driverExpense = z.object({
+  type: expenseType,
+  amount: amount.refine((n) => n > 0, 'debe ser mayor que 0'),
+  note: text(300).optional(),
+  receiptFileId: z.string().trim().regex(/^pod-[a-z0-9]{10,40}$/).optional(),
+});
+export const reviewExpense = z.object({ decision: z.enum(['aprobado', 'rechazado']), reason: text(300).optional() });
+export const createPreInvoice = z.object({ ...targetTenant, customerId: id, from: dateOnly, to: dateOnly, notes: text(1000).optional() });
+export const createSettlement = z.object({ driverId: id, from: dateOnly, to: dateOnly });
+export const driverMonthlyCost = z.object({ monthlyCost: amount.nullable() });
+
+// ---------- TMS T4: ruteo y planificación ----------
+
+export const routingPlan = z.object({
+  startTime: isoDateTime,
+  orderIds: z.array(id).min(1, 'elegí al menos un pedido').max(200),
+  vehicleIds: z.array(id).min(1, 'elegí al menos una unidad').max(100),
+  depotPlaceId: id.optional(),
+});
+export const routingApply = z.object({
+  proposals: z
+    .array(
+      z.object({
+        vehicleId: id,
+        driverId: id,
+        plannedStart: isoDateTime,
+        orderIds: z.array(id).min(1).max(200),
+        taskOrder: z.array(z.string().trim().regex(/^[A-Za-z0-9_-]+:[cd]$/)).min(2).max(400),
+        acceptWarnings: z.object({ reason: text(300) }).optional(),
+      })
+    )
+    .min(1)
+    .max(100),
+});

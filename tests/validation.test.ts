@@ -66,7 +66,7 @@ describe('validación de entradas', () => {
     });
     assert.equal(ok.status, 200, JSON.stringify(ok.json));
     assert.equal(ok.json.role.permissions.reportes, 'read');
-    assert.equal(Object.keys(ok.json.role.permissions).length, 10);
+    assert.equal(Object.keys(ok.json.role.permissions).length, 11);
   });
 
   test('campos no permitidos se descartan (no hay asignación masiva)', async () => {
