@@ -458,6 +458,28 @@ export class CostsService {
     return { km: Math.round(km * 10) / 10, source: 'estimado' };
   }
 
+  /** Carrier trip: the cost is the agreed price plus approved trip expenses paid by the company. */
+  private carrierEconomics(t: Trip): TripEconomics {
+    const { km, source } = this.tripKm(t);
+    const expenses = this.state.tripExpenses.filter((e) => e.tripId === t.id && e.status === 'aprobado').reduce((a, e) => a + e.amount, 0);
+    const lines = [{ label: `Fletero ${t.carrier!.carrierName} (precio pactado)`, amount: round2(t.carrier!.price) }];
+    if (expenses > 0) lines.push({ label: 'Gastos del viaje', amount: round2(expenses) });
+    const total = round2(lines.reduce((a, l) => a + l.amount, 0));
+    const orderIds = new Set(t.stops.flatMap((s) => s.orderIds));
+    const delivered = this.state.transportOrders.filter((o) => orderIds.has(o.id) && o.status === 'entregado');
+    const revenue = round2(delivered.reduce((a, o) => a + (o.charge?.amount ?? 0), 0));
+    const margin = round2(revenue - total);
+    return {
+      tripId: t.id,
+      revenue,
+      unpricedOrders: delivered.filter((o) => !o.charge).map((o) => o.id),
+      cost: { lines, total, km, kmSource: source, fuelEstimated: false },
+      margin,
+      marginPct: revenue > 0 ? Math.round((margin / revenue) * 1000) / 10 : null,
+      currency: this.ctx().currencyOf(t.tenantId),
+    };
+  }
+
   /** Maintenance cost per km of a unit: last 12 months of maintenance over the km of its trips in that time. */
   private maintenancePerKm(v: Vehicle): number {
     const since = Date.now() - 365 * 86_400_000;
@@ -468,6 +490,7 @@ export class CostsService {
   }
 
   economics(t: Trip): TripEconomics {
+    if (t.carrier) return this.carrierEconomics(t);
     const v = this.state.vehicles.find((x) => x.id === t.vehicleId);
     const d = this.state.drivers.find((x) => x.id === t.driverId);
     const { km, source } = this.tripKm(t);
@@ -537,8 +560,8 @@ export class CostsService {
         groupBy === 'viaje'
           ? t.id
           : groupBy === 'unidad'
-            ? (this.state.vehicles.find((v) => v.id === t.vehicleId)?.unitCode ?? '—')
-            : (this.state.drivers.find((d) => d.id === t.driverId)?.name ?? '—');
+            ? (this.state.vehicles.find((v) => v.id === t.vehicleId)?.unitCode ?? (t.carrier ? `Fletero ${t.carrier.carrierName}` : '—'))
+            : (this.state.drivers.find((d) => d.id === t.driverId)?.name ?? (t.carrier ? `${t.carrier.driverName} (fletero)` : '—'));
       add(key, label, { trips: 1, km: e.cost.km, revenue: e.revenue, cost: e.cost.total });
     }
     const finish = (g: ProfitRow): ProfitRow => {
@@ -619,6 +642,8 @@ export class CostsService {
   voidPreInvoice(scope: TmsScope, id: string, reason: string, actor: TmsActor): PreInvoice {
     const pf = this.findPreInvoice(scope, id);
     if (pf.status === 'anulada') throw new TmsError('La pre-factura ya está anulada.', 409);
+    const inv = pf.invoiceId ? this.state.invoices.find((i) => i.id === pf.invoiceId) : undefined;
+    if (inv && !inv.creditNoteId) throw new TmsError(`Tiene la factura ${inv.letter} ${String(inv.pointOfSale).padStart(5, '0')}-${String(inv.number).padStart(8, '0')}: anulala con una nota de crédito antes.`, 409);
     pf.status = 'anulada';
     pf.voidReason = reason.trim();
     // Its orders can be billed again.

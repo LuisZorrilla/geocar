@@ -129,5 +129,5 @@ export function buildTmsDemo(tenants: Tenant[], vehicles: Vehicle[], codeOf: (te
     v.tankLiters = heavy ? 400 : 80;
   }
   for (const d of drivers) d.monthlyCost ??= 1_450_000;
-  return { customers, places, transportOrders, trips: [], tariffs, fuelLoads: [], tripExpenses: [], preInvoices: [], driverSettlements: [] };
+  return { customers, places, transportOrders, trips: [], tariffs, fuelLoads: [], tripExpenses: [], preInvoices: [], driverSettlements: [], invoices: [], apiKeys: [], webhooks: [], webhookDeliveries: [], portalUsers: [], portalSessions: [], carriers: [], carrierSettlements: [] };
 }

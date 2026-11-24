@@ -7,6 +7,7 @@ import type { DeliveryNoteInput } from './documents.ts';
 import { foldText } from '../../src/shared/drivers.ts';
 import { CUIT_MESSAGES, cuitProblem, taxIdKey } from '../../src/shared/cuit.ts';
 import { distanceMeters, isValidLatLng } from '../../src/shared/geo.ts';
+import { carrierDriverId, carrierVehicleId, tripUnit, type Carrier } from '../../src/shared/carriers.ts';
 import {
   buildStops,
   currentStop,
@@ -28,6 +29,7 @@ import {
   type Cargo,
   type Customer,
   type CustomerContact,
+  type OrderSource,
   type OrderStatus,
   type Place,
   type PlaceKind,
@@ -158,6 +160,7 @@ export interface OrderInput {
   reference?: string;
   notes?: string;
   confirm?: boolean;
+  source?: OrderSource;
 }
 
 export interface TripInput {
@@ -473,6 +476,7 @@ export class TmsService {
       notes: input.notes?.trim() || undefined,
       status: input.confirm ? 'confirmado' : 'borrador',
       trackingToken: newSecret(),
+      source: input.source,
       createdBy: actor.hidden ? 'Superadmin' : actor.name,
       createdAt: at,
       updatedAt: at,
@@ -558,7 +562,7 @@ export class TmsService {
   }
 
   tripView(t: Trip, withTenant = false): TripView {
-    const v = this.state.vehicles.find((x) => x.id === t.vehicleId);
+    const v = tripUnit(t, this.state.vehicles);
     const d = this.state.drivers.find((x) => x.id === t.driverId);
     const now = new Date();
     const stops = t.stops.map((s) => {
@@ -571,7 +575,8 @@ export class TmsService {
       ...t,
       unitCode: v?.unitCode ?? '—',
       plate: v?.plate ?? '',
-      driverName: d?.name ?? '—',
+      driverName: d?.name ?? t.carrier?.driverName ?? '—',
+      carrier: t.carrier ? { ...t.carrier, linkTokenHash: undefined, linkActive: Boolean(t.carrier.linkTokenHash) } : undefined,
       tenantName: withTenant ? this.tenantName(t.tenantId) : undefined,
       stops,
       orders: this.ordersOf(t).map((o) => ({
@@ -585,7 +590,7 @@ export class TmsService {
         (t.status === 'planificado' || t.status === 'en_curso') &&
         t.stops.some((s) => s.kind === 'descarga' && s.status === 'pendiente' && s.window?.to && Date.parse(s.window.to) < now.getTime()),
       nextStopDistanceM:
-        v && curPlace && (t.status === 'en_curso' || t.status === 'planificado') ? Math.round(distanceMeters(v, curPlace)) : undefined,
+        v && curPlace && Number.isFinite(v.lat) && (t.status === 'en_curso' || t.status === 'planificado') ? Math.round(distanceMeters(v, curPlace)) : undefined,
     };
   }
 
@@ -717,11 +722,70 @@ export class TmsService {
     return this.tripView(trip);
   }
 
+  /**
+   * Trip run by a third-party carrier: same orders/stops/tracking as a fleet trip, without unit or
+   * driver checks (the carrier's documents are checked by the caller).
+   */
+  createCarrierTrip(
+    tenantId: string,
+    input: { carrier: Carrier; plate: string; driverName: string; driverDni?: string; driverPhone?: string; price: number; plannedStart: string; orderIds: string[]; notes?: string },
+    override: { warnings: string[]; reason: string } | undefined,
+    actor: TmsActor
+  ): TripView {
+    if (input.orderIds.length === 0) throw new TmsError('Elegí al menos un pedido.');
+    const orders = input.orderIds.map((id) => this.findOrder({ tenantId }, id));
+    const notReady = orders.find((o) => o.status !== 'confirmado');
+    if (notReady) throw new TmsError(`El pedido ${notReady.id} está ${ORDER_STATUS_LABELS[notReady.status].toLowerCase()}: solo se planifican pedidos confirmados.`, 409);
+    if (!Number.isFinite(Date.parse(input.plannedStart))) throw new TmsError('Fecha de salida inválida.');
+    const at = nowIso();
+    const id = this.nextFolio('VJ', tenantId, this.state.trips);
+    const trip: Trip = {
+      id,
+      tenantId,
+      vehicleId: carrierVehicleId(input.carrier.id),
+      driverId: carrierDriverId(id),
+      plannedStart: new Date(input.plannedStart).toISOString(),
+      status: 'planificado',
+      stops: buildStops(orders, () => `stp-${uid()}`),
+      notes: input.notes?.trim() || undefined,
+      carrier: {
+        carrierId: input.carrier.id,
+        carrierName: input.carrier.name,
+        plate: input.plate.trim().toUpperCase(),
+        driverName: input.driverName.trim(),
+        driverDni: input.driverDni?.replace(/\D/g, '') || undefined,
+        driverPhone: input.driverPhone?.trim() || undefined,
+        price: Math.round(input.price * 100) / 100,
+      },
+      overrides: override ? { warnings: override.warnings, reason: override.reason.trim(), by: actor.name, at } : undefined,
+      history: [],
+      createdBy: actor.hidden ? 'Superadmin' : actor.name,
+      createdAt: at,
+      updatedAt: at,
+    };
+    for (const o of orders) {
+      o.status = 'planificado';
+      o.tripId = trip.id;
+      o.updatedAt = at;
+    }
+    const detail = `Fletero ${input.carrier.name} · ${trip.carrier!.plate} · ${trip.carrier!.driverName} · ${orders.length} pedido(s), precio ${trip.carrier!.price}.`;
+    this.addHistory(trip, actor.name, 'Viaje planificado', detail);
+    if (trip.overrides) this.addHistory(trip, actor.name, 'Advertencias aceptadas', `${trip.overrides.warnings.join(' ')} Motivo: ${trip.overrides.reason}.`);
+    this.state.trips.push(trip);
+    this.audit(tenantId, actor, 'Viaje con fletero', trip.id, `${detail}${trip.overrides ? ` Aceptó: ${trip.overrides.reason}` : ''}`);
+    this.ctx().persist();
+    return this.tripView(trip);
+  }
+
   updateTrip(scope: TmsScope, id: string, patch: TripPatch, actor: TmsActor): TripView {
     const t = this.findTrip(scope, id);
     if (t.status !== 'planificado') throw new TmsError('Solo se edita un viaje planificado.', 409);
     const changes: string[] = [];
-    if (patch.vehicleId || patch.driverId || patch.plannedStart) {
+    if (t.carrier && (patch.vehicleId || patch.driverId)) throw new TmsError('Es un viaje de fletero: cambiá el fletero, la patente o el chofer desde los datos del fletero del viaje.', 409);
+    if (t.carrier && patch.plannedStart) {
+      t.plannedStart = new Date(patch.plannedStart).toISOString();
+      changes.push('salida');
+    } else if (patch.vehicleId || patch.driverId || patch.plannedStart) {
       const next = {
         vehicleId: patch.vehicleId ?? t.vehicleId,
         driverId: patch.driverId ?? t.driverId,
@@ -782,7 +846,9 @@ export class TmsService {
     const t = this.findTrip(scope, id);
     if (t.status !== 'planificado') throw new TmsError(`El viaje está ${TRIP_STATUS_LABELS[t.status].toLowerCase()}.`, 409);
     // Re-check the hard rules at departure: something may have changed since planning.
-    const check = this.validate(t.tenantId, { vehicleId: t.vehicleId, driverId: t.driverId, plannedStart: t.plannedStart, orderIds: this.ordersOf(t).map((o) => o.id) }, t.id);
+    const check = t.carrier
+      ? { blocks: [], warnings: [] }
+      : this.validate(t.tenantId, { vehicleId: t.vehicleId, driverId: t.driverId, plannedStart: t.plannedStart, orderIds: this.ordersOf(t).map((o) => o.id) }, t.id);
     if (check.blocks.length) throw new TmsError(check.blocks[0].message, 409, { check });
     this.begin(t, actor.name, 'Inicio manual.');
     this.audit(t.tenantId, actor, 'Viaje iniciado', t.id, 'Inicio manual.');
@@ -902,7 +968,7 @@ export class TmsService {
     // The unit's position only while it is on its way to this destination (never before or after).
     if (trip?.status === 'en_curso' && unload && (unload.status === 'pendiente' || unload.status === 'en_lugar') && dest) {
       const current = currentStop(trip);
-      const v = this.state.vehicles.find((x) => x.id === trip.vehicleId);
+      const v = tripUnit(trip, this.state.vehicles);
       if (v && current && v.lastReportAt && now.getTime() - Date.parse(v.lastReportAt) < 30 * 60_000) {
         // Remaining path: unit → pending stops up to this destination (straight lines).
         let dist = 0;
@@ -953,7 +1019,7 @@ export class TmsService {
   async deliveryNoteData(order: TransportOrder): Promise<DeliveryNoteInput> {
     const { trip, stop } = this.deliveryOf(order);
     const tenant = this.state.tenants.find((x) => x.id === order.tenantId);
-    const v = trip ? this.state.vehicles.find((x) => x.id === trip.vehicleId) : undefined;
+    const v = trip ? tripUnit(trip, this.state.vehicles) : undefined;
     const signature = stop?.pod ? ((await this.ctx().repo.getTmsFile(order.tenantId, stop.pod.signatureFileId))?.data ?? null) : null;
     return {
       carrier: tenant?.name ?? '',
@@ -965,7 +1031,7 @@ export class TmsService {
       trip,
       stop,
       unit: v ? { unitCode: v.unitCode, plate: v.plate } : undefined,
-      driverName: trip ? this.state.drivers.find((d) => d.id === trip.driverId)?.name : undefined,
+      driverName: trip ? (this.state.drivers.find((d) => d.id === trip.driverId)?.name ?? trip.carrier?.driverName) : undefined,
       signature,
     };
   }
@@ -1012,7 +1078,8 @@ export class TmsService {
     if (!token || token.length < 20) return null;
     const hash = hashToken(token);
     const d = this.state.drivers.find((x) => x.appAccess?.tokenHash === hash);
-    if (!d || d.enabled === false) return null;
+    if (!d) return this.carrierByTripToken(hash);
+    if (d.enabled === false) return null;
     const now = Date.now();
     // Record activity at most every 5 minutes (it's informative, not worth a write per request).
     if (!d.appAccess!.lastSeenAt || now - Date.parse(d.appAccess!.lastSeenAt) > 5 * 60_000) {
@@ -1020,6 +1087,37 @@ export class TmsService {
       this.ctx().persist();
     }
     return d;
+  }
+
+  /**
+   * The carrier's per-trip link opens the same driver app: it acts as a "driver" that only has that
+   * trip (id = the trip's synthetic driverId). Valid while the trip is open and 24 h after it ends.
+   */
+  private carrierByTripToken(hash: string): Driver | null {
+    const t = this.state.trips.find((x) => x.carrier?.linkTokenHash === hash);
+    if (!t || t.status === 'cancelado') return null;
+    if (t.status === 'finalizado' && Date.now() - Date.parse(t.finishedAt ?? '') > 24 * 3600_000) return null;
+    const now = Date.now();
+    if (!t.carrier!.lastSeenAt || now - Date.parse(t.carrier!.lastSeenAt) > 5 * 60_000) {
+      t.carrier!.lastSeenAt = new Date(now).toISOString();
+      this.ctx().persist();
+    }
+    return { id: t.driverId, tenantId: t.tenantId, name: t.carrier!.driverName, enabled: true } as unknown as Driver;
+  }
+
+  /** Phone position shared by a carrier from the trip link (fleet drivers are tracked by their unit). */
+  carrierPosition(driver: Driver, input: { lat: number; lng: number; accuracyM?: number }): boolean {
+    const t = this.state.trips.find((x) => x.carrier && x.driverId === driver.id && x.tenantId === driver.tenantId);
+    if (!t || (t.status !== 'planificado' && t.status !== 'en_curso')) return false;
+    if (!isValidLatLng(input.lat, input.lng)) throw new TmsError('Posición inválida.');
+    const prev = t.carrier!.lastPosition;
+    const at = nowIso();
+    // At most one stored position every 10 s.
+    if (prev && Date.parse(at) - Date.parse(prev.at) < 10_000) return true;
+    t.carrier!.lastPosition = { lat: input.lat, lng: input.lng, accuracyM: input.accuracyM, at };
+    this.evaluateTrips(new Date(), { tenantId: t.tenantId });
+    this.ctx().persist();
+    return true;
   }
 
   /** The driver's trips: planned and in progress, plus those finished in the last 24 h. */
@@ -1134,7 +1232,7 @@ export class TmsService {
   reportDriverIssue(driver: Driver, tripId: string, input: { type: DriverReportType; note: string; stopId?: string; photoFileId?: string }): { incident: Incident; trip: TripView } {
     const t = this.driverTrip(driver, tripId);
     const meta = DRIVER_REPORT_TYPES[input.type];
-    const v = this.state.vehicles.find((x) => x.id === t.vehicleId);
+    const v = tripUnit(t, this.state.vehicles);
     const stop = input.stopId ? t.stops.find((s) => s.id === input.stopId) : currentStop(t);
     const place = stop ? this.state.places.find((p) => p.id === stop.placeId) : undefined;
     const at = nowIso();
@@ -1204,7 +1302,7 @@ export class TmsService {
     for (const t of this.state.trips) {
       if (!inScope(scope, t.tenantId)) continue;
       if (t.status !== 'en_curso' && t.status !== 'planificado') continue;
-      const v = this.state.vehicles.find((x) => x.id === t.vehicleId);
+      const v = tripUnit(t, this.state.vehicles);
       const stop = currentStop(t);
       const place = stop ? this.state.places.find((p) => p.id === stop.placeId) : undefined;
 
@@ -1238,7 +1336,7 @@ export class TmsService {
         if (!isStopLate(s, now)) continue;
         s.delayAlertedAt = now.toISOString();
         const p = this.state.places.find((x) => x.id === s.placeId);
-        if (v) this.raiseDelayAlert(t, s, p?.name ?? 'destino', v, now);
+        if (v) this.raiseDelayAlert(t, s, p?.name ?? 'destino', Number.isFinite(v.lat) ? v : { ...v, lat: p?.lat ?? 0, lng: p?.lng ?? 0 }, now);
         this.addHistory(t, system, 'Entrega demorada', `${p?.name ?? 'Destino'}: la ventana cerró sin llegada.`);
         changes += 1;
       }

@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react';
-import { Pencil, Plus, ReceiptText, Search, Trash2 } from 'lucide-react';
+import { Pencil, Plus, ReceiptText, Search, Trash2, UsersRound } from 'lucide-react';
 import type { Customer, CustomerContact, Place } from '../../shared/tms.ts';
 import { TariffDialog } from './TariffDialog.tsx';
+import { PortalUsersDialog } from './PortalUsersDialog.tsx';
 import { apiRequest } from '../../lib/api.ts';
 import { foldText } from '../../shared/drivers.ts';
 import { Pagination, usePagination } from '../Pagination.tsx';
@@ -28,6 +29,7 @@ export function CustomersPanel({
   const [q, setQ] = useState('');
   const [editing, setEditing] = useState<Customer | 'new' | null>(null);
   const [tariffOf, setTariffOf] = useState<Customer | null>(null);
+  const [portalOf, setPortalOf] = useState<Customer | null>(null);
   const filtered = useMemo(() => {
     const n = foldText(q);
     return customers.filter((c) => !n || foldText(`${c.name} ${c.taxId}`).includes(n));
@@ -84,6 +86,11 @@ export function CustomersPanel({
                     </button>
                   )}
                   {canWrite && (
+                    <button type="button" onClick={() => setPortalOf(c)} aria-label={`Portal de ${c.name}`} title="Accesos al portal de clientes" className="p-1.5 rounded-md text-slate-400 hover:text-violet-300 hover:bg-violet-500/10 cursor-pointer">
+                      <UsersRound className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                  {canWrite && (
                     <button type="button" onClick={() => setEditing(c)} aria-label={`Editar ${c.name}`} className="p-1.5 rounded-md text-slate-400 hover:text-sky-300 hover:bg-sky-500/10 cursor-pointer">
                       <Pencil className="w-3.5 h-3.5" />
                     </button>
@@ -96,6 +103,7 @@ export function CustomersPanel({
         {filtered.length === 0 && <div className="p-8 text-center text-slate-400">{q ? 'Ningún cliente coincide con la búsqueda.' : 'Todavía no hay clientes. Cargá el primero para crear pedidos.'}</div>}
         <Pagination page={pag.page} totalItems={pag.totalItems} pageSize={10} onPageChange={pag.setPage} />
       </div>
+      {portalOf && <PortalUsersDialog customer={portalOf} notify={notify} onClose={() => setPortalOf(null)} />}
       {tariffOf && (
         <TariffDialog
           customer={tariffOf}

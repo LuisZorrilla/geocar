@@ -3,10 +3,12 @@ import { AlertTriangle, Check, FileUp, Fuel, Loader2, Plus, Trash2, X } from 'lu
 import type { Driver, Vehicle } from '../../shared/types.ts';
 import type { Customer } from '../../shared/tms.ts';
 import { EXPENSE_LABELS, FUEL_FLAG_LABELS, parseAmount, type DriverSettlement, type ExpenseType, type FuelImportRow, type FuelLoad, type PreInvoice, type TripExpense } from '../../shared/costs.ts';
+import { invoiceNumber, type Invoice } from '../../shared/billing.ts';
 import { apiRequest, ApiError, getAuthToken, getTenantScope } from '../../lib/api.ts';
 import { useMoney } from '../../lib/money.tsx';
 import { ExportMenu } from '../ExportMenu.tsx';
 import { ReasonDialog } from './OrdersPanel.tsx';
+import { InvoicesSection } from './InvoicesPanel.tsx';
 import { AuthImage, Dialog, Field, btnGhost, btnPrimary, errMsg, fmtDateTime, fromLocalInput, inputCls, toLocalInput } from './ui.tsx';
 
 type Notify = (text: string, tone?: 'ok' | 'warn' | 'err') => void;
@@ -497,6 +499,8 @@ export function BillingPanel({ customers, drivers, canWrite, canApprove, creatio
   const [newPf, setNewPf] = useState(false);
   const [newLq, setNewLq] = useState(false);
   const [voiding, setVoiding] = useState<PreInvoiceRow | null>(null);
+  const [invoicing, setInvoicing] = useState<string | null>(null);
+  const [invoicesKey, setInvoicesKey] = useState(0);
   const load = useCallback(async () => {
     try {
       const [a, b] = await Promise.all([apiRequest<{ items: PreInvoiceRow[] }>('/api/costs/pre-invoices'), apiRequest<{ items: SettlementRow[] }>('/api/costs/settlements')]);
@@ -518,6 +522,20 @@ export function BillingPanel({ customers, drivers, canWrite, canApprove, creatio
       notify(errMsg(err, 'No se pudo completar.'), 'err');
     }
   };
+  const invoice = async (p: PreInvoiceRow) => {
+    setInvoicing(p.id);
+    try {
+      const r = await apiRequest<{ invoice: Invoice }>(`/api/billing/pre-invoices/${encodeURIComponent(p.id)}/invoice`, { method: 'POST' });
+      const n = `${r.invoice.letter} ${invoiceNumber(r.invoice.pointOfSale, r.invoice.number)}`;
+      notify(r.invoice.status === 'simulada' ? `Factura ${n} generada en modo simulado (sin validez fiscal).` : `Factura ${n} autorizada por ARCA. CAE ${r.invoice.cae}.`, r.invoice.status === 'simulada' ? 'warn' : 'ok');
+      void load();
+      setInvoicesKey((k) => k + 1);
+    } catch (err) {
+      notify(errMsg(err, 'No se pudo facturar.'), 'err');
+    } finally {
+      setInvoicing(null);
+    }
+  };
   const pill = (s: string) => (s === 'emitida' || s === 'pagada' ? 'text-emerald-300' : s === 'anulada' ? 'text-slate-500 line-through' : 'text-amber-300');
 
   return (
@@ -526,7 +544,7 @@ export function BillingPanel({ customers, drivers, canWrite, canApprove, creatio
         <div className="flex items-center justify-between gap-2">
           <div>
             <h2 className="text-sm font-semibold text-slate-100">Pre-facturas a clientes</h2>
-            <p className="text-xs text-slate-400">Pedidos entregados y con precio de un período. Documento interno para pasar a facturación (la factura electrónica de ARCA llega en T5).</p>
+            <p className="text-xs text-slate-400">Pedidos entregados y con precio de un período. Documento interno; una vez emitida se factura electrónicamente con «Facturar».</p>
           </div>
           {canWrite && <button type="button" className={btnPrimary} disabled={Boolean(creationBlocked)} title={creationBlocked} onClick={() => setNewPf(true)}><Plus className="w-3.5 h-3.5" /> Nueva pre-factura</button>}
         </div>
@@ -540,12 +558,17 @@ export function BillingPanel({ customers, drivers, canWrite, canApprove, creatio
                   <td className="py-2 px-3 text-slate-200">{p.customerName}</td>
                   <td className="py-2 px-3 font-mono text-slate-300">{p.periodFrom} a {p.periodTo}</td>
                   <td className="py-2 px-3 text-right font-mono text-slate-100">{money.fmtIn(p.total, p.currency)}</td>
-                  <td className={`py-2 px-3 font-medium ${pill(p.status)}`}>{p.status === 'borrador' ? 'Borrador' : p.status === 'emitida' ? 'Emitida' : 'Anulada'}</td>
+                  <td className={`py-2 px-3 font-medium ${pill(p.status)}`}>{p.status === 'borrador' ? 'Borrador' : p.status === 'emitida' ? (p.invoiceId ? 'Facturada' : 'Emitida') : 'Anulada'}</td>
                   <td className="py-2 px-3">
                     <div className="flex justify-end items-center gap-1">
                       <ExportMenu url={`/api/costs/pre-invoices/${p.id}/export`} fileName={p.id} label="Descargar" />
                       {canApprove && p.status === 'borrador' && <button type="button" className={btnGhost} onClick={() => void act(`/api/costs/pre-invoices/${p.id}/issue`, `${p.id} emitida.`)}>Emitir</button>}
-                      {canApprove && p.status !== 'anulada' && <button type="button" className={`${btnGhost} text-rose-300`} onClick={() => setVoiding(p)}>Anular</button>}
+                      {canApprove && p.status === 'emitida' && !p.invoiceId && (
+                        <button type="button" className={btnGhost} disabled={invoicing !== null} onClick={() => void invoice(p)}>
+                          {invoicing === p.id && <Loader2 className="w-3.5 h-3.5 animate-spin" />} Facturar
+                        </button>
+                      )}
+                      {canApprove && p.status !== 'anulada' && !p.invoiceId && <button type="button" className={`${btnGhost} text-rose-300`} onClick={() => setVoiding(p)}>Anular</button>}
                     </div>
                   </td>
                 </tr>
@@ -555,6 +578,8 @@ export function BillingPanel({ customers, drivers, canWrite, canApprove, creatio
           {pfs && pfs.length === 0 && <div className="p-6 text-center text-slate-400">Todavía no hay pre-facturas.</div>}
         </div>
       </section>
+
+      <InvoicesSection canApprove={canApprove} notify={notify} reloadKey={invoicesKey} onChanged={() => void load()} />
 
       <section className="space-y-2">
         <div className="flex items-center justify-between gap-2">

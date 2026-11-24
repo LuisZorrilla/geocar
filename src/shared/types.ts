@@ -2,6 +2,10 @@ import type { CurrencyChange, CurrencyCode, CurrencyDef, ExchangeRate, MoneySnap
 import type { DriverAuthState, DriverAuthorization, DriverDocument, DriverProfile } from './drivers.ts';
 import type { Customer, DriverAppAccess, Place, TransportOrder, Trip } from './tms.ts';
 import type { DriverSettlement, FuelLoad, PreInvoice, Tariff, TripExpense } from './costs.ts';
+import type { Invoice } from './billing.ts';
+import type { ApiKey, Webhook, WebhookDelivery } from './integrations.ts';
+import type { PortalSession, PortalUser } from './portal.ts';
+import type { Carrier, CarrierSettlement } from './carriers.ts';
 export type AssetType = 'vehiculo' | 'maquinaria_pesada';
 
 export type MaintenanceStatus = 'al_dia' | 'proximo' | 'vencido';
@@ -778,6 +782,14 @@ export interface FleetStoreState {
   tripExpenses: TripExpense[];
   preInvoices: PreInvoice[];
   driverSettlements: DriverSettlement[];
+  invoices: Invoice[];
+  apiKeys: ApiKey[];
+  webhooks: Webhook[];
+  webhookDeliveries: WebhookDelivery[];
+  portalUsers: PortalUser[];
+  portalSessions: PortalSession[];
+  carriers: Carrier[];
+  carrierSettlements: CarrierSettlement[];
   sizing: SizingConfig;
 }
 

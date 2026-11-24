@@ -82,7 +82,8 @@ const field = 'w-full rounded-xl border border-slate-700 bg-[#0B1120] px-3.5 py-
 
 export function DriverApp() {
   const [token] = useState(readToken);
-  const [me, setMe] = useState<{ driver: { name: string; company: string }; trips: TripRow[] } | null>(null);
+  const [me, setMe] = useState<{ driver: { name: string; company: string }; carrier?: boolean; trips: TripRow[] } | null>(null);
+  const [sharing, setSharing] = useState<'off' | 'on' | 'denied'>('off');
   const [error, setError] = useState<string | null>(null);
   const [denied, setDenied] = useState(false);
   const [openId, setOpenId] = useState<string | null>(null);
@@ -109,6 +110,24 @@ export function DriverApp() {
     const t = setInterval(() => void load(), 60_000);
     return () => clearInterval(t);
   }, [load]);
+
+  // Carriers have no fleet tracker: while their trip is open the phone shares its position.
+  const tripOpen = Boolean(me?.carrier && me.trips.some((t) => t.status === 'planificado' || t.status === 'en_curso'));
+  useEffect(() => {
+    if (!token || !tripOpen || !navigator.geolocation) return;
+    let last = 0;
+    const id = navigator.geolocation.watchPosition(
+      (p) => {
+        setSharing('on');
+        if (Date.now() - last < 20_000) return;
+        last = Date.now();
+        void call(token, 'POST', '/position', { lat: p.coords.latitude, lng: p.coords.longitude, accuracyM: Math.round(p.coords.accuracy) }).catch(() => undefined);
+      },
+      () => setSharing('denied'),
+      { enableHighAccuracy: true, maximumAge: 15_000, timeout: 30_000 }
+    );
+    return () => navigator.geolocation.clearWatch(id);
+  }, [token, tripOpen]);
 
   if (!token || denied) {
     return (
@@ -142,10 +161,17 @@ export function DriverApp() {
         </button>
       </header>
       {error && <div role="alert" className="m-4 rounded-xl border border-rose-500/40 bg-rose-500/10 p-3 text-rose-200">{error}</div>}
+      {tripOpen && (
+        <div className={`mx-4 mt-3 rounded-xl border p-3 text-sm ${sharing === 'denied' ? 'border-amber-500/40 bg-amber-500/10 text-amber-100' : 'border-sky-500/30 bg-sky-500/10 text-sky-100'}`}>
+          {sharing === 'denied'
+            ? 'Activá la ubicación del celular para este sitio: la empresa necesita seguir el viaje y detectar las llegadas.'
+            : 'Mientras el viaje esté abierto compartís tu ubicación con la empresa (solo desde esta página).'}
+        </div>
+      )}
       {!me ? (
         <div className="mt-16 flex justify-center text-slate-400"><Loader2 className="w-6 h-6 animate-spin" /></div>
       ) : trip ? (
-        <TripScreen token={token} trip={trip} onChanged={load} />
+        <TripScreen token={token} trip={trip} carrier={Boolean(me.carrier)} onChanged={load} />
       ) : (
         <TripList trips={me.trips} onOpen={setOpenId} />
       )}
@@ -204,7 +230,7 @@ function StopIcon({ s }: { s: Stop }) {
   return <Circle className="w-6 h-6 text-slate-600 shrink-0" aria-hidden />;
 }
 
-function TripScreen({ token, trip, onChanged }: { token: string; trip: TripRow; onChanged: () => Promise<void> }) {
+function TripScreen({ token, trip, carrier, onChanged }: { token: string; trip: TripRow; carrier: boolean; onChanged: () => Promise<void> }) {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ text: string; ok: boolean } | null>(null);
   const [modal, setModal] = useState<{ kind: 'deliver' | 'fail' | 'report' | 'fuel' | 'expense'; stop?: Stop } | null>(null);
@@ -302,7 +328,7 @@ function TripScreen({ token, trip, onChanged }: { token: string; trip: TripRow; 
         })}
       </ol>
 
-      {!closed && trip.status === 'en_curso' && (
+      {!closed && !carrier && trip.status === 'en_curso' && (
         <div className="grid grid-cols-2 gap-2">
           <button type="button" className={`${big} border border-slate-700 text-slate-100`} onClick={() => setModal({ kind: 'fuel' })}>
             <Fuel className="w-5 h-5" /> Combustible

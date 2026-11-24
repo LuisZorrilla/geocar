@@ -1,4 +1,4 @@
-# Operaciones (TMS) — Fases T1 a T4
+# Operaciones (TMS) — Fases T1 a T5
 
 Módulo para el ciclo operativo del transporte: **clientes → lugares → pedidos → viajes → entregas**, con seguimiento automático de cada parada a partir de la posición que ya reportan las unidades.
 
@@ -318,9 +318,145 @@ El motor es **híbrido**: usa OSRM y VROOM si están configurados (ver [RUTEO.md
 | `POST /api/routing/plan/apply` | Crea los viajes: `{ proposals: [{ vehicleId, driverId, plannedStart, orderIds, taskOrder, acceptWarnings? }] }` |
 | `GET /api/routing/dispatch?from=&to=` | Tablero del período |
 
-## Próximas fases
+## Fase T5: factura electrónica, integraciones, portal del cliente y fleteros
 
-- **T2**: app del chofer con el viaje y prueba de entrega (foto y firma), link de seguimiento para el cliente, remito y hoja de ruta.
-- **T3**: combustible, costos, tarifas y facturación.
-- **T4**: ruteo y optimización.
-- **T5**: documentos fiscales (COT, Carta de Porte electrónica) e integraciones.
+### Factura electrónica ARCA (Operaciones → Facturación)
+
+Una pre-factura **emitida** se convierte en factura electrónica con **«Facturar»**.
+
+**Letra del comprobante:**
+
+- emisor Responsable Inscripto: **A** si el cliente es RI, **B** en los demás casos;
+- emisor Monotributo o Exento: **C**.
+
+**Importes:** la pre-factura es el neto. A y B suman IVA (21 % por defecto, configurable); C no lo discrimina. En la nota de crédito, el comprobante asociado se informa a ARCA.
+
+**Documento del receptor:**
+
+| Dato del cliente | Se informa como |
+|---|---|
+| CUIT | CUIT (80) |
+| DNI | DNI (96) |
+| Sin documento | Consumidor final (99) |
+
+Se informa también la condición frente al IVA del receptor (RG 5616).
+
+**Comprobante:** el PDF incluye recuadro de letra, datos del emisor y receptor, detalle por pedido, CAE con vencimiento y **QR fiscal (RG 4892)**.
+
+**Corrección:** una factura se corrige con **nota de crédito** por el total. La pre-factura queda libre para volver a facturarla o anularla. Mientras tenga una factura vigente, la pre-factura no se puede anular.
+
+**Requisito:** la empresa debe operar en **pesos (ARS)**.
+
+**Configuración** («Configurar ARCA», solo administradores):
+
+1. Completar los datos del emisor: razón social, CUIT, domicilio, condición de IVA, punto de venta *Web Services*, Ingresos Brutos e inicio de actividades.
+2. Generar el **pedido de certificado (CSR)**. La clave privada se crea en el servidor y **nunca se descarga**.
+3. Subir el CSR a ARCA:
+   - homologación: WSASS;
+   - producción: «Administración de certificados digitales».
+4. Asociar el certificado al servicio `wsfe`.
+5. Pegar el certificado y usar **«Probar conexión»**, que hace el login WSAA y consulta los últimos números.
+
+**Modos:**
+
+| Modo | Cuándo | Comprobante |
+|---|---|---|
+| Simulado | Sin certificado | Mismo flujo, CAE ficticio, marca «SIN VALIDEZ FISCAL»; no se llama a ARCA |
+| Homologación | Certificado cargado, entorno de pruebas (por defecto) | CAE real de prueba, sin validez fiscal |
+| Producción | Se elige en la configuración | Comprobante válido |
+
+**Seguridad:**
+
+- El certificado y la clave se guardan cifrados con AES-256-GCM cuando el servidor tiene `SECRETS_KEY`: 64 caracteres hexadecimales, generados con `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`.
+- El ticket de acceso de WSAA se reutiliza mientras está vigente.
+- Si ARCA rechaza un comprobante, se muestra su mensaje (código y texto) y no se guarda nada.
+
+### API pública y webhooks (Operaciones → Integraciones)
+
+Solo administradores. Claves con permisos, `/api/v1` (pedidos con idempotencia, viajes, catálogo, facturas) y webhooks firmados con HMAC-SHA256 y reintentos.
+
+Los eventos se detectan comparando el estado en cada guardado, así salen igual desde el panel, la app del chofer, el ruteo, la API o el portal.
+
+Guía para integradores: [docs/API.md](API.md).
+
+### Portal del cliente (`/portal`)
+
+**Alta de accesos:** en **Clientes → ícono de personas**, la empresa da acceso por email. Se genera una **contraseña temporal** (se ve una vez, con texto listo para enviar) que el usuario cambia al entrar.
+
+**Qué ve el cliente**, siempre solo lo suyo:
+
+- sus pedidos: en curso, entregados, búsqueda;
+- el historial de cada pedido y la hora estimada;
+- el link al mapa de seguimiento;
+- el **remito** (firmado, si ya se entregó);
+- sus **facturas** con PDF.
+
+**Pedidos nuevos:** el cliente puede cargar pedidos, que llegan como **borrador** para que la empresa los confirme. Solo elige entre los lugares propios y los compartidos de la empresa.
+
+**Seguridad:**
+
+- login y sesiones separados del panel, de 12 h de inactividad y 7 días máximo;
+- bloqueo de 15 minutos tras 5 intentos fallidos;
+- desactivar el acceso o restablecer la contraseña cierra las sesiones.
+
+### Fleteros tercerizados (Operaciones → Fleteros)
+
+**Ficha:** CUIT validado, contacto, vehículos (patente y capacidad) y documentación con vencimiento:
+
+- seguro de carga;
+- RUTA;
+- RC;
+- VTV;
+- habilitación.
+
+Sin seguro de carga o RUTA vigentes, un viaje solo se asigna si un administrador lo aprueba con motivo, y la aprobación queda auditada.
+
+**Viaje con fletero:** «Asignar viaje» con patente, chofer, **precio pactado** y pedidos confirmados. Es un viaje normal: paradas, seguimiento, entrega con firma, remito, facturación y webhooks.
+
+- **Costo:** es el precio pactado, más los gastos del viaje que pague la empresa.
+- **Link por viaje:** desde el detalle del viaje se genera un link con QR o WhatsApp. Abre la app del chofer con **solo ese viaje**:
+  - sin combustible ni gastos;
+  - el celular **comparte su ubicación** mientras el viaje está abierto;
+  - esa ubicación alimenta las llegadas automáticas, la hora estimada y el seguimiento del cliente.
+
+  El link vence 24 h después de terminado el viaje o al revocarlo.
+- **Calificación:** de 1 a 5 al cerrar el viaje. La ficha muestra el promedio y las entregas tarde.
+- **Liquidaciones:** reúnen los viajes finalizados del período al precio pactado; se exportan en PDF, Excel o CSV. Al marcarla pagada se registra la referencia del pago. Anularla libera los viajes.
+- **Tablero de despacho:** cada fletero tiene su fila.
+
+### API de T5
+
+| Método y ruta | Uso |
+|---|---|
+| `GET`/`PUT /api/billing/arca-config` | Configuración de ARCA (administradores) |
+| `POST /api/billing/arca-config/csr` | Genera la clave y devuelve el CSR |
+| `POST`/`DELETE /api/billing/arca-config/certificate` | Carga o quita el certificado (`{ certPem, keyPem? }`) |
+| `POST /api/billing/arca-config/test` | Prueba de conexión |
+| `POST /api/billing/pre-invoices/:id/invoice` | Factura una pre-factura emitida |
+| `GET /api/billing/invoices` · `GET /api/billing/invoices/:id/pdf` | Comprobantes |
+| `POST /api/billing/invoices/:id/credit-note` | Nota de crédito `{ reason }` |
+| `GET /api/integrations` · `POST /api/integrations/api-keys` · `DELETE /api/integrations/api-keys/:id` | Claves |
+| `POST`/`PATCH`/`DELETE /api/integrations/webhooks[/:id]` · `POST /…/:id/test` · `POST /…/:id/rotate-secret` · `GET /…/:id/deliveries` | Webhooks |
+| `POST /api/integrations/deliveries/:id/redeliver` | Reenvío |
+| `GET`/`POST /api/tms/customers/:id/portal-users` · `POST /api/tms/portal-users/:id/reset-password` · `PATCH /api/tms/portal-users/:id` | Accesos al portal |
+| `/api/portal/*` | Portal (encabezado `x-portal-token`) |
+| `GET`/`POST /api/carriers` · `PATCH /api/carriers/:id` | Fleteros |
+| `POST /api/carriers/trips` · `PATCH /api/carriers/trips/:id` | Viaje con fletero; patente, chofer o precio |
+| `POST`/`DELETE /api/carriers/trips/:id/link` · `POST /api/carriers/trips/:id/rating` | Link del viaje y calificación |
+| `GET`/`POST /api/carriers/settlements` · `POST /…/:id/pay` · `POST /…/:id/void` · `GET /…/:id/export?format=` | Liquidaciones a fleteros |
+| `POST /api/driver-app/position` | Posición del celular del fletero `{ lat, lng, accuracyM? }` |
+
+**Datos:** migración `009_t5.sql` con las tablas `invoices`, `api_keys`, `webhooks`, `webhook_deliveries`, `portal_users`, `portal_sessions`, `carriers` y `carrier_settlements`. La configuración y los secretos de ARCA están en `app_settings`.
+
+**Variables nuevas:**
+
+| Variable | Uso |
+|---|---|
+| `SECRETS_KEY` | Cifrado del certificado de ARCA |
+| `PUBLIC_APP_URL` | Dirección pública del panel, para los links de seguimiento en la API y los webhooks |
+
+## Pendientes
+
+- **COT** (ARBA y otras provincias) y **Carta de Porte electrónica** (granos): no incluidos en T5.
+- Probar la factura con el certificado real de homologación y luego en producción.
+- Probar el portal y el link del fletero con clientes y celulares reales.

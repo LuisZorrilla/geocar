@@ -18,6 +18,10 @@ import { TmsService } from './tms/service.ts';
 import { buildTmsDemo } from './tms/demo.ts';
 import { CostsService } from './tms/costs.ts';
 import { RoutingService } from './routing/service.ts';
+import { BillingService } from './billing/service.ts';
+import { IntegrationsService } from './integrations/service.ts';
+import { PortalService } from './portal/service.ts';
+import { CarriersService } from './carriers/service.ts';
 import { RoutingEngine, routingConfigFromEnv } from './routing/provider.ts';
 import {
   newPhoneIdentifier,
@@ -1792,6 +1796,43 @@ class FleetStore {
     }),
     new RoutingEngine(routingConfigFromEnv())
   );
+  /** T5: electronic invoices with ARCA (simulated mode without certificate). */
+  readonly billing = new BillingService(() => ({
+    state: this.state,
+    repo: this.repo,
+    audit: (entry) => {
+      this.addAuditLog(entry);
+    },
+    persist: () => this.persist(this.state),
+    currencyOf: (tenantId) => this.currency.tenantCurrency(tenantId),
+  }));
+  /** T5: public API keys and webhooks. */
+  readonly integrations = new IntegrationsService(() => ({
+    state: this.state,
+    audit: (entry) => {
+      this.addAuditLog(entry);
+    },
+    persist: () => this.persist(this.state),
+  }));
+  /** T5: customer portal (own users and sessions per customer). */
+  readonly portal = new PortalService(() => ({
+    state: this.state,
+    tms: this.tms,
+    audit: (entry) => {
+      this.addAuditLog(entry);
+    },
+    persist: () => this.persist(this.state),
+  }));
+  /** T5: third-party carriers (catalog, carrier trips, ratings, settlements). */
+  readonly carriers = new CarriersService(() => ({
+    state: this.state,
+    tms: this.tms,
+    audit: (entry) => {
+      this.addAuditLog(entry);
+    },
+    persist: () => this.persist(this.state),
+    currencyOf: (tenantId) => this.currency.tenantCurrency(tenantId),
+  }));
   /** TMS T3: tariffs, fuel, expenses, trip cost, pre-invoices and settlements. */
   readonly costs = new CostsService(() => ({
     state: this.state,
@@ -1840,6 +1881,8 @@ class FleetStore {
     this.obdServerOverride = await this.repo.getAppSetting<{ host: string; port: number }>('obd_server');
     this.cameraServerOverride = await this.repo.getAppSetting<CameraServerOverride>('camera_server');
     await this.currency.load();
+    this.integrations.resetSnapshot();
+    this.integrations.start();
     this.initialized = true;
   }
 
@@ -1856,7 +1899,7 @@ class FleetStore {
         changed = true;
       }
     }
-    for (const key of ['customers', 'places', 'transportOrders', 'trips', 'tariffs', 'fuelLoads', 'tripExpenses', 'preInvoices', 'driverSettlements'] as const) {
+    for (const key of ['customers', 'places', 'transportOrders', 'trips', 'tariffs', 'fuelLoads', 'tripExpenses', 'preInvoices', 'driverSettlements', 'invoices', 'apiKeys', 'webhooks', 'webhookDeliveries', 'portalUsers', 'portalSessions', 'carriers', 'carrierSettlements'] as const) {
       if (!Array.isArray(this.state[key])) {
         (this.state as unknown as Record<string, unknown[]>)[key] = [];
         changed = true;
@@ -1929,11 +1972,21 @@ class FleetStore {
       tripExpenses: [],
       preInvoices: [],
       driverSettlements: [],
+      invoices: [],
+      apiKeys: [],
+      webhooks: [],
+      webhookDeliveries: [],
+      portalUsers: [],
+      portalSessions: [],
+      carriers: [],
+      carrierSettlements: [],
     };
   }
 
   /** Queue a diff-based write of the whole state to PostgreSQL. */
   private persist(nextState: FleetStoreState): void {
+    // Webhook events of what changed since the previous save (queued in the same write).
+    if (this.initialized) this.integrations.detectChanges();
     const write = this.repo.saveState(nextState);
     write.catch((err) => console.error('[db] Error al guardar el estado:', err));
     this.pendingWrite = write;
@@ -1946,6 +1999,7 @@ class FleetStore {
 
   /** Writes anything still waiting in the persistSoon() debounce. Call before the process exits. */
   async shutdown(): Promise<void> {
+    this.integrations.stop();
     if (this.persistTimer) {
       clearTimeout(this.persistTimer);
       this.persistTimer = null;
@@ -3313,6 +3367,11 @@ class FleetStore {
     this.persist(this.state);
     await this.revokeUserSessions(admin.id);
     return { username: admin.username, temporaryPassword };
+  }
+
+  /** Live state (read-only use: public API representations). */
+  getState(): FleetStoreState {
+    return this.state;
   }
 
   getTenantById(tenantId: string): Tenant | undefined {

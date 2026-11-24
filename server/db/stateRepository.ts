@@ -207,6 +207,14 @@ const TABLES: TableDef[] = [
   documentTable('tripExpenses', 'trip_expenses'),
   documentTable('preInvoices', 'pre_invoices'),
   documentTable('driverSettlements', 'driver_settlements'),
+  documentTable('invoices', 'invoices'),
+  documentTable('apiKeys', 'api_keys'),
+  documentTable('webhooks', 'webhooks'),
+  documentTable('webhookDeliveries', 'webhook_deliveries'),
+  documentTable('portalUsers', 'portal_users'),
+  documentTable('portalSessions', 'portal_sessions'),
+  documentTable('carriers', 'carriers'),
+  documentTable('carrierSettlements', 'carrier_settlements'),
 ];
 
 export const ALL_TABLES = [...TABLES.map((t) => t.table), 'app_settings', 'sessions', 'driver_files', 'tms_files', 'obd_samples', 'obd_fault_events'];

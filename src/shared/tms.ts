@@ -1,3 +1,4 @@
+import type { TripCarrier } from './carriers.ts';
 /**
  * TMS (transport management): customers, places, transport orders and trips.
  *
@@ -88,11 +89,21 @@ export interface TransportOrder {
   trackingToken?: string;
   /** What the customer is charged (priced with the tariff on delivery, adjustable by hand). */
   charge?: OrderCharge;
+  /** Where the order came from (panel by default). */
+  source?: OrderSource;
   cancelReason?: string;
   deliveredAt?: string;
   createdBy: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface OrderSource {
+  channel: 'panel' | 'api' | 'portal';
+  apiKeyId?: string;
+  /** Idempotency-Key of the API request that created it (a retry returns the same order). */
+  idempotencyKey?: string;
+  portalUserId?: string;
 }
 
 export type TripStatus = 'planificado' | 'en_curso' | 'finalizado' | 'cancelado';
@@ -206,6 +217,8 @@ export interface Trip {
   route?: { km: number; minutes: number; engine: 'osrm' | 'estimado'; computedAt: string };
   /** Last time the live ETAs were computed. */
   etaComputedAt?: string;
+  /** Third-party carrier running this trip (vehicleId/driverId are synthetic then). */
+  carrier?: TripCarrier;
   /** Odometer at start and end (real km of the trip). */
   startOdometerKm?: number;
   endOdometerKm?: number;

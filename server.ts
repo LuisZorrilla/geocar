@@ -18,6 +18,10 @@ import { registerTmsRoutes } from './server/tms/routes.ts';
 import { registerDriverAppRoutes } from './server/tms/driverAppRoutes.ts';
 import { registerCostsRoutes } from './server/tms/costsRoutes.ts';
 import { registerRoutingRoutes } from './server/routing/routes.ts';
+import { registerBillingRoutes } from './server/billing/routes.ts';
+import { registerIntegrationRoutes, registerPublicApiRoutes } from './server/integrations/routes.ts';
+import { registerPortalAdminRoutes, registerPortalRoutes } from './server/portal/routes.ts';
+import { registerCarrierRoutes } from './server/carriers/routes.ts';
 import { TmsError } from './server/tms/service.ts';
 import { registerCurrencyRoutes } from './server/currency/routes.ts';
 import * as traccar from './server/traccar/client.ts';
@@ -465,6 +469,12 @@ async function startServer() {
   registerDriverAppRoutes(app);
   registerCostsRoutes(app, { requireAuth, getRequestedScope, targetTenantOrFail });
   registerRoutingRoutes(app, { requireAuth, getRequestedScope, targetTenantOrFail });
+  registerBillingRoutes(app, { requireAuth, getRequestedScope, targetTenantOrFail });
+  registerIntegrationRoutes(app, { requireAuth, getRequestedScope, targetTenantOrFail });
+  registerPublicApiRoutes(app);
+  registerPortalAdminRoutes(app, { requireAuth, getRequestedScope, targetTenantOrFail });
+  registerPortalRoutes(app);
+  registerCarrierRoutes(app, { requireAuth, getRequestedScope, targetTenantOrFail });
 
   app.get('/api/vehicles/:id/dossier', (req, res) => {
     const ctx = requireAuth(req, res);

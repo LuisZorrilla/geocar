@@ -9,6 +9,7 @@ import { Pagination } from '../Pagination.tsx';
 import { ExportMenu } from '../ExportMenu.tsx';
 import { TmsMap, type MapCircle } from './TmsMap.tsx';
 import { ReasonDialog, type OrderRow } from './OrdersPanel.tsx';
+import { CarrierTripCard } from './CarriersPanel.tsx';
 import { AuthImage, Dialog, Field, TripStatusPill, btnGhost, btnPrimary, copyTrackingLink, errMsg, fmtDateTime, fromLocalInput, inputCls, stopLabel, stopToneClass, toLocalInput } from './ui.tsx';
 
 type Notify = (text: string, tone?: 'ok' | 'warn' | 'err') => void;
@@ -542,7 +543,11 @@ export function TripDetail({
       })) ?? [],
     [trip, current?.id]
   );
-  const unit = useMemo(() => (vehicle ? { lat: vehicle.lat, lng: vehicle.lng, label: vehicle.unitCode } : null), [vehicle?.lat, vehicle?.lng, vehicle?.unitCode]);
+  const carrierPos = trip?.carrier?.lastPosition;
+  const unit = useMemo(
+    () => (carrierPos ? { lat: carrierPos.lat, lng: carrierPos.lng, label: trip?.carrier?.plate ?? 'Fletero' } : vehicle ? { lat: vehicle.lat, lng: vehicle.lng, label: vehicle.unitCode } : null),
+    [carrierPos?.lat, carrierPos?.lng, trip?.carrier?.plate, vehicle?.lat, vehicle?.lng, vehicle?.unitCode]
+  );
   const editable = canWrite && trip && (trip.status === 'planificado' || trip.status === 'en_curso');
   const routeKey = trip ? `${trip.id}|${trip.status}|${trip.stops.map((s) => `${s.id}:${s.status}`).join(',')}` : '';
   useEffect(() => {
@@ -713,6 +718,7 @@ export function TripDetail({
                   <span className="text-slate-500">({route.engine === 'osrm' ? 'rutas por calle' : 'distancias estimadas'})</span>
                 </p>
               )}
+              {trip.carrier && <CarrierTripCard tripId={trip.id} status={trip.status} carrier={trip.carrier} canWrite={canWrite} notify={notify} onChanged={() => void load()} />}
               {trip.status !== 'planificado' && trip.status !== 'cancelado' && <TripEconomicsCard tripId={trip.id} version={trip.updatedAt} />}
               <div className="rounded-lg border border-slate-800 bg-[#11192C]">
                 <div className="px-3 py-2 border-b border-slate-800 font-medium text-slate-200">Pedidos</div>

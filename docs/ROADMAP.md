@@ -211,4 +211,6 @@ Detalle en [docs/TMS.md](TMS.md).
 - [ ] T3, pendiente de datos reales: probar la importación con un resumen real de la tarjeta de flota; cargar el tanque y la capacidad de las unidades y el costo mensual de los choferes.
 - [x] T4: ruteo híbrido (OSRM + VROOM si están configurados, motor propio si no), «Optimizar orden» de un viaje, planificador del día (qué unidad lleva qué pedidos y en qué orden), tablero de despacho con línea de tiempo, hora estimada en vivo por parada y alerta anticipada «Demora prevista».
 - [ ] T4, en el VPS: instalar OSRM y VROOM ([docs/RUTEO.md](RUTEO.md)) y cargar `OSRM_URL` y `VROOM_URL`; cargar el tiempo de carga y descarga de cada lugar.
-- [ ] T5: COT y Carta de Porte electrónica, factura de ARCA, portal del cliente, API y webhooks, tercerizados.
+- [x] T5: factura electrónica ARCA (WSAA + WSFEv1: A/B/C, nota de crédito, CAE, QR fiscal, PDF; modo simulado sin certificado y homologación), API pública `/api/v1` con claves y permisos, webhooks firmados con reintentos, portal del cliente (`/portal`) y fleteros tercerizados (documentación, viaje con link y ubicación del celular, calificación y liquidaciones).
+- [ ] T5, pendiente: cargar el certificado de homologación de ARCA y probar contra el servidor real; definir `SECRETS_KEY` y `PUBLIC_APP_URL` en el VPS; probar el portal y el link del fletero con usuarios reales.
+- [ ] Fuera de T5 por decisión: COT y Carta de Porte electrónica.

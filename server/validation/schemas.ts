@@ -828,3 +828,43 @@ export const routingApply = z.object({
     .min(1)
     .max(100),
 });
+
+// ---------- T5: facturación electrónica ARCA ----------
+
+export const arcaConfig = z.object({
+  environment: z.enum(['homologacion', 'produccion']).optional(),
+  cuit: z.string().trim().max(20).optional(),
+  pointOfSale: z.coerce.number().int().min(1).max(99998).optional(),
+  ivaCondition: z.enum(['responsable_inscripto', 'monotributo', 'exento']).optional(),
+  ivaRate: z.union([z.literal(21), z.literal(10.5), z.literal(27)]).optional(),
+  businessName: text(160).optional(),
+  address: text(240).optional(),
+  iibb: text(40).optional(),
+  activityStart: z.union([z.literal(''), dateOnly]).optional(),
+  paymentDays: z.coerce.number().int().min(0).max(365).optional(),
+});
+const pem = (label: string) => z.string().trim().max(20_000).refine((s) => s.includes(`-----BEGIN ${label}`) || (label === 'PRIVATE KEY' && s.includes('-----BEGIN RSA PRIVATE KEY')), `debe ser un ${label} en formato PEM`);
+export const arcaCertificate = z.object({ certPem: pem('CERTIFICATE'), keyPem: pem('PRIVATE KEY').optional() });
+
+// ---------- T5: API pública y webhooks ----------
+
+const apiScope = z.enum(['orders:read', 'orders:write', 'trips:read', 'catalog:read', 'catalog:write', 'invoices:read']);
+const webhookEvent = z.enum(['order.created', 'order.status_changed', 'trip.created', 'trip.status_changed', 'stop.status_changed', 'delivery.proof', 'invoice.issued']);
+export const createApiKey = z.object({ name: requiredText(80), scopes: z.array(apiScope).min(1).max(6) });
+export const createWebhook = z.object({ url: z.string().trim().min(8).max(500), events: z.array(webhookEvent).min(1).max(7), description: text(160).optional() });
+export const updateWebhook = z.object({ url: z.string().trim().min(8).max(500), events: z.array(webhookEvent).min(1).max(7), description: text(160), active: z.boolean() }).partial();
+/** Public API (no targetTenant: the key decides the company). */
+export const apiCreateOrder = z.object({ ...orderFields, confirm: z.boolean().optional() });
+export const apiCreateCustomer = z.object(customerFields);
+export const apiCreatePlace = z.object(placeFields);
+
+/** Customer portal: the customer is the logged-in one; always a draft. */
+const { customerId: _portalCustomer, ...portalOrderFields } = orderFields;
+export const portalCreateOrder = z.object(portalOrderFields);
+
+/** Phone position shared by a carrier from its trip link. */
+export const driverPosition = z.object({
+  lat: z.coerce.number().finite().min(-90).max(90),
+  lng: z.coerce.number().finite().min(-180).max(180),
+  accuracyM: z.coerce.number().finite().nonnegative().max(100_000).optional(),
+});

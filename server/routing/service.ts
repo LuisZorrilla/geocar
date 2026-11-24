@@ -1,3 +1,4 @@
+import { tripUnit } from '../../src/shared/carriers.ts';
 import crypto from 'crypto';
 import type { AlertEvent, AuditLog, Driver, FleetStoreState, Vehicle } from '../../src/shared/types.ts';
 import { computeDriverAuthorization } from '../../src/shared/drivers.ts';
@@ -107,10 +108,12 @@ export class RoutingService {
   async optimizeTrip(scope: TmsScope, tripId: string) {
     const t = this.findTrip(scope, tripId);
     if (t.status !== 'planificado') throw new TmsError('Solo se reordena un viaje planificado.', 409);
-    const v = this.state.vehicles.find((x) => x.id === t.vehicleId);
+    const v = tripUnit(t, this.state.vehicles);
     if (!v) throw new TmsError('Unidad no encontrada.', 404);
     const places = t.stops.map((s) => this.place(s.placeId)!);
-    const { matrix, engine } = await this.engine.matrix([{ lat: v.lat, lng: v.lng }, ...places]);
+    // A carrier without a shared position starts at its first stop.
+    const start = Number.isFinite(v.lat) ? { lat: v.lat, lng: v.lng } : places[0];
+    const { matrix, engine } = await this.engine.matrix([start, ...places]);
     const tasks = this.stopTasks(t, t.stops, 1);
     const spec: VehicleSpec = { id: v.id, startNode: 0, availableFrom: Date.parse(t.plannedStart), availableTo: Date.parse(t.plannedStart) + DAY_SPAN_MS };
     const current = evaluateRoute(spec, tasks, matrix, { allowLate: true });
@@ -134,10 +137,10 @@ export class RoutingService {
   /** Route geometry, legs and ETA of each stop (live from the unit when the trip is running). */
   async tripRoute(scope: TmsScope, tripId: string, now = new Date()) {
     const t = this.findTrip(scope, tripId);
-    const v = this.state.vehicles.find((x) => x.id === t.vehicleId);
+    const v = tripUnit(t, this.state.vehicles);
     const running = t.status === 'en_curso';
     const pending = running ? t.stops.filter((s) => s.status === 'pendiente' || s.status === 'en_lugar') : t.stops;
-    const fromUnit = v && (running || t.status === 'planificado');
+    const fromUnit = v && Number.isFinite(v.lat) && (running || t.status === 'planificado');
     const points: Pt[] = [...(fromUnit ? [{ lat: v!.lat, lng: v!.lng }] : []), ...pending.map((s) => this.place(s.placeId)!).filter(Boolean)];
     const route = await this.engine.route(points);
     const legs = fromUnit ? route.legs.map((l) => l.minutes) : [0, ...route.legs.map((l) => l.minutes)];
@@ -326,7 +329,13 @@ export class RoutingService {
     if (!(from < to)) throw new TmsError('Rango inválido.');
     const vehicles = this.state.vehicles.filter((v) => inScope(scope, v.tenantId) && v.assetType === 'vehiculo');
     const drivers = new Map(this.state.drivers.map((d: Driver) => [d.id, d.name]));
-    const rows = vehicles.map((v) => {
+    // Carriers get their own row (one per carrier) after the fleet units.
+    const carrierUnits = new Map<string, { id: string; unitCode: string; plate: string; carrier: true }>();
+    for (const t of this.state.trips) {
+      if (t.carrier && inScope(scope, t.tenantId) && !carrierUnits.has(t.vehicleId)) carrierUnits.set(t.vehicleId, { id: t.vehicleId, unitCode: `Fletero · ${t.carrier.carrierName}`, plate: t.carrier.plate, carrier: true });
+    }
+    const units: Array<{ id: string; unitCode: string; plate: string; carrier?: true }> = [...vehicles, ...carrierUnits.values()];
+    const rows = units.map((v) => {
       const trips = this.state.trips
         .filter((t) => t.vehicleId === v.id && t.status !== 'cancelado')
         .map((t) => {
@@ -345,7 +354,8 @@ export class RoutingService {
         .map(({ t, startAt, endAt }) => ({
           id: t.id,
           status: t.status,
-          driverName: drivers.get(t.driverId) ?? '—',
+          driverName: drivers.get(t.driverId) ?? t.carrier?.driverName ?? '—',
+          plate: t.carrier?.plate,
           startAt: new Date(startAt).toISOString(),
           endAt: new Date(endAt).toISOString(),
           estimatedEnd: !t.finishedAt,
@@ -364,14 +374,14 @@ export class RoutingService {
             };
           }),
         }));
-      return { vehicleId: v.id, unitCode: v.unitCode, plate: v.plate, trips };
+      return { vehicleId: v.id, unitCode: v.unitCode, plate: v.plate, carrier: Boolean(v.carrier), trips };
     });
     return {
       from: new Date(from).toISOString(),
       to: new Date(to).toISOString(),
       now: now.toISOString(),
-      rows: rows.filter((r) => r.trips.length).sort((a, b) => a.unitCode.localeCompare(b.unitCode)),
-      idle: rows.filter((r) => !r.trips.length).map((r) => ({ vehicleId: r.vehicleId, unitCode: r.unitCode, plate: r.plate })),
+      rows: rows.filter((r) => r.trips.length).sort((a, b) => Number(a.carrier) - Number(b.carrier) || a.unitCode.localeCompare(b.unitCode)),
+      idle: rows.filter((r) => !r.trips.length && !r.carrier).map((r) => ({ vehicleId: r.vehicleId, unitCode: r.unitCode, plate: r.plate })),
     };
   }
 
@@ -390,7 +400,7 @@ export class RoutingService {
     let changed = 0;
     for (const t of this.state.trips.filter((x) => x.status === 'en_curso')) {
       if (t.etaComputedAt && now.getTime() - Date.parse(t.etaComputedAt) < 2 * 60_000) continue;
-      const v = this.state.vehicles.find((x) => x.id === t.vehicleId);
+      const v = tripUnit(t, this.state.vehicles);
       if (!v?.lastReportAt || now.getTime() - Date.parse(v.lastReportAt) > 30 * 60_000) continue;
       const pending = t.stops.filter((s) => s.status === 'pendiente' || s.status === 'en_lugar');
       if (!pending.length) continue;

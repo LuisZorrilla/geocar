@@ -30,6 +30,7 @@ export function registerDriverAppRoutes(app: express.Express) {
     return d;
   };
   const scopeOf = (d: Driver) => ({ tenantId: d.tenantId });
+  const isCarrier = (d: Driver) => d.id.startsWith('carrier-trip:');
   const noStore = (res: express.Response) => res.setHeader('Cache-Control', 'no-store');
 
   app.get('/api/driver-app/me', (req, res) => {
@@ -37,7 +38,20 @@ export function registerDriverAppRoutes(app: express.Express) {
     if (!d) return;
     noStore(res);
     const tenant = fleetStore.getTenantById(d.tenantId);
-    res.json({ driver: { id: d.id, name: d.name, company: tenant?.name ?? '' }, trips: tms().driverTrips(d) });
+    res.json({ driver: { id: d.id, name: d.name, company: tenant?.name ?? '' }, carrier: isCarrier(d), trips: tms().driverTrips(d) });
+  });
+
+  /** Phone position of a carrier while its trip is open (fleet drivers are tracked by their unit). */
+  app.post('/api/driver-app/position', (req, res) => {
+    const d = driverOf(req, res);
+    if (!d) return;
+    const body = parseBody(schemas.driverPosition, req, res);
+    if (!body) return;
+    if (!isCarrier(d)) {
+      res.status(204).end();
+      return;
+    }
+    res.json({ stored: tms().carrierPosition(d, body) });
   });
 
   app.post('/api/driver-app/trips/:id/start', (req, res) => {
@@ -107,6 +121,10 @@ export function registerDriverAppRoutes(app: express.Express) {
     try {
       const d = driverOf(req, res);
       if (!d) return;
+      if (isCarrier(d)) {
+        res.status(403).json({ error: 'El combustible del fletero corre por su cuenta.' });
+        return;
+      }
       const body = parseBody(schemas.driverFuel, req, res);
       if (!body) return;
       const trip = tms().driverTrip(d, req.params.id);
@@ -122,6 +140,10 @@ export function registerDriverAppRoutes(app: express.Express) {
   app.post('/api/driver-app/trips/:id/expenses', (req, res) => {
     const d = driverOf(req, res);
     if (!d) return;
+    if (isCarrier(d)) {
+      res.status(403).json({ error: 'Los gastos del fletero se acuerdan en el precio del viaje.' });
+      return;
+    }
     const body = parseBody(schemas.driverExpense, req, res);
     if (!body) return;
     const trip = tms().driverTrip(d, req.params.id);

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { AlertTriangle, Building2, CalendarRange, CircleCheck, ClipboardList, FileText, Fuel, GanttChart, MapPin, Receipt, TrendingUp, Truck, X } from 'lucide-react';
+import { AlertTriangle, Building2, CalendarRange, CircleCheck, ClipboardList, FileText, Fuel, GanttChart, MapPin, Plug, Receipt, Handshake, TrendingUp, Truck, X } from 'lucide-react';
 import { PlannerPanel } from './PlannerPanel.tsx';
 import { DispatchPanel } from './DispatchPanel.tsx';
 import { BillingPanel, ExpensesPanel, FuelPanel, ProfitabilityPanel } from './CostsPanels.tsx';
@@ -10,9 +10,11 @@ import { TripsPanel } from './TripsPanel.tsx';
 import { OrdersPanel } from './OrdersPanel.tsx';
 import { CustomersPanel } from './CustomersPanel.tsx';
 import { PlacesPanel } from './PlacesPanel.tsx';
+import { IntegrationsPanel } from './IntegrationsPanel.tsx';
+import { CarriersPanel } from './CarriersPanel.tsx';
 import { errMsg } from './ui.tsx';
 
-type Tab = 'viajes' | 'planificador' | 'despacho' | 'pedidos' | 'clientes' | 'lugares' | 'combustible' | 'gastos' | 'facturacion' | 'rentabilidad';
+type Tab = 'viajes' | 'planificador' | 'despacho' | 'pedidos' | 'clientes' | 'lugares' | 'combustible' | 'gastos' | 'facturacion' | 'rentabilidad' | 'integraciones' | 'fleteros';
 interface Toast {
   id: number;
   text: string;
@@ -90,10 +92,12 @@ export function OperationsView({
     ['pedidos', 'Pedidos', ClipboardList],
     ['clientes', `Clientes (${customers.length})`, Building2],
     ['lugares', `Lugares (${places.length})`, MapPin],
+    ['fleteros', 'Fleteros', Handshake],
     ['combustible', 'Combustible', Fuel],
     ['gastos', 'Gastos', Receipt],
     ['facturacion', 'Facturación', FileText],
     ['rentabilidad', 'Rentabilidad', TrendingUp],
+    ...(canApprove && !allCompanies ? ([['integraciones', 'Integraciones', Plug]] as Array<[Tab, string, typeof Truck]>) : []),
   ];
 
   return (
@@ -144,6 +148,8 @@ export function OperationsView({
       {tab === 'combustible' && <FuelPanel vehicles={vehicles} canWrite={canWrite} creationBlocked={creationBlocked} notify={notify} />}
       {tab === 'gastos' && <ExpensesPanel canWrite={canWrite} canApprove={canApprove} creationBlocked={creationBlocked} notify={notify} />}
       {tab === 'facturacion' && <BillingPanel customers={customers} drivers={drivers} canWrite={canWrite} canApprove={canApprove} creationBlocked={creationBlocked} notify={notify} />}
+      {tab === 'fleteros' && <CarriersPanel canWrite={canWrite} canApprove={canApprove} creationBlocked={creationBlocked} notify={notify} onChanged={changed} />}
+      {tab === 'integraciones' && <IntegrationsPanel key={tenant.id} notify={notify} />}
       {tab === 'rentabilidad' && <ProfitabilityPanel drivers={drivers} canApprove={canApprove} notify={notify} />}
       {tab === 'lugares' && <PlacesPanel places={places} customers={customers} canWrite={canWrite} creationBlocked={creationBlocked} notify={notify} onChanged={() => void loadMasters()} />}
 

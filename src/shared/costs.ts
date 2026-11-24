@@ -416,6 +416,8 @@ export interface PreInvoice {
   createdAt: string;
   issuedAt?: string;
   voidReason?: string;
+  /** ARCA invoice issued from this pre-invoice (T5). */
+  invoiceId?: string;
 }
 
 export interface DriverSettlement {
